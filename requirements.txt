@@ -1,0 +1,17 @@
+opencv-python
+numpy
+pandas
+scikit-learn
+matplotlib
+PyYAML
+tqdm
+onnxruntime
+onnx
+tensorrt
+torch
+torchvision
+huggingface_hub
+pillow
+einops
+omegaconf
+safetensors

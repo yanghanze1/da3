@@ -1,0 +1,16 @@
+rotation_matrix:
+- - 0.766044
+  - 0.0
+  - -0.642788
+- - 0.0
+  - 1.0
+  - 0.0
+- - 0.642788
+  - 0.0
+  - 0.766044
+translation_vector:
+- -1.2256704
+- 0.0
+- -1.0284608
+reprojection_error_px: 0.0
+delta_z_m: 1.6

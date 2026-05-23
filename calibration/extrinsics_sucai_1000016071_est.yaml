@@ -1,0 +1,16 @@
+rotation_matrix:
+- - 1.0
+  - 0.0
+  - 0.0
+- - 0.0
+  - 1.0
+  - 0.0
+- - 0.0
+  - 0.0
+  - 1.0
+translation_vector:
+- 0.0
+- 0.0
+- 0.0
+reprojection_error_px: 0.0
+delta_z_m: 0.4

@@ -1,0 +1,19 @@
+image_width: 360
+image_height: 640
+camera_matrix:
+- - 420.0
+  - 0.0
+  - 180.0
+- - 0.0
+  - 420.0
+  - 320.0
+- - 0.0
+  - 0.0
+  - 1.0
+dist_coeffs:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+reprojection_error: 0.0
