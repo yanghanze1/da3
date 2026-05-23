@@ -10,6 +10,10 @@ from .geometry import bbox_iou, points_in_bbox, signed_plane_distance
 from .models import CandidateObservation, CrossFrameMatch, PlaneEstimate, RoiCandidate
 
 
+class _CandidateObservationList(list):
+    pass
+
+
 def _cluster_bbox(points_2d: np.ndarray) -> list[int]:
     min_xy = np.floor(points_2d.min(axis=0)).astype(int)
     max_xy = np.ceil(points_2d.max(axis=0)).astype(int)
@@ -41,6 +45,143 @@ def _optional_float(config: dict[str, Any], key: str) -> float | None:
 
 def _valid_dimension(value: float, max_value: float | None) -> bool:
     return np.isfinite(value) and value >= 0.0 and (max_value is None or value <= max_value)
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    out = float(value)
+    return out if np.isfinite(out) else None
+
+
+def _int_bbox(value: Any) -> list[int]:
+    bbox = list(value or [0, 0, 0, 0])[:4]
+    while len(bbox) < 4:
+        bbox.append(0)
+    return [int(v) for v in bbox]
+
+
+def _finite_range(values: np.ndarray) -> list[float] | None:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if len(finite) == 0:
+        return None
+    return [float(np.min(finite)), float(np.max(finite))]
+
+
+def _sample_image_points(points_2d: np.ndarray, max_points: int) -> list[list[int]]:
+    if len(points_2d) == 0 or max_points == 0:
+        return []
+    points = np.asarray(points_2d[:, :2], dtype=np.float64)
+    if max_points > 0 and len(points) > max_points:
+        indices = np.linspace(0, len(points) - 1, max_points).round().astype(int)
+        points = points[indices]
+    return np.rint(points).astype(int).tolist()
+
+
+def _new_roi_cluster_trace(
+    roi: RoiCandidate,
+    roi_image: np.ndarray,
+    roi_world: np.ndarray,
+    delta_i: np.ndarray | None,
+    positive_mask: np.ndarray | None,
+    negative_mask: np.ndarray | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = roi.metadata or {}
+    max_points = int(config.get("trace_max_points_per_sign", 1000))
+    valid_delta = np.isfinite(delta_i) if delta_i is not None else np.zeros((len(roi_world),), dtype=bool)
+    positive = positive_mask if positive_mask is not None else np.zeros((len(roi_world),), dtype=bool)
+    negative = negative_mask if negative_mask is not None else np.zeros((len(roi_world),), dtype=bool)
+    return {
+        "roi_id": str(roi.roi_id),
+        "source": str(roi.source),
+        "bbox": _int_bbox(roi.bbox),
+        "raw_bbox": _int_bbox(metadata.get("raw_bbox", roi.bbox)),
+        "area_px": int(roi.area_px),
+        "mask_fill_ratio": _finite_float(metadata.get("mask_fill_ratio")),
+        "point_count": int(metadata.get("point_count", len(roi_world)) or 0),
+        "total_point_count": int(len(roi_world)),
+        "valid_residual_point_count": int(np.count_nonzero(valid_delta)),
+        "positive_abnormal_point_count": int(np.count_nonzero(positive)),
+        "negative_abnormal_point_count": int(np.count_nonzero(negative)),
+        "positive_abnormal_image_points_sample": _sample_image_points(roi_image[positive], max_points),
+        "negative_abnormal_image_points_sample": _sample_image_points(roi_image[negative], max_points),
+        "abnormal_point_sample_limit": max_points,
+        "candidate_generated": False,
+        "candidate_count": 0,
+        "candidate_ids": [],
+        "cluster_count": 0,
+        "dbscan_input_point_count": 0,
+        "dbscan_noise_point_count": 0,
+        "primary_reject_reason": "accepted",
+        "cluster_reject_reason_counts": {},
+        "sign_traces": [],
+    }
+
+
+def _record_reject(sign_trace: dict[str, Any], reason: str) -> None:
+    sign_trace.setdefault("reject_reasons", []).append(reason)
+
+
+def _configured_sources(config: dict[str, Any], key: str) -> set[str]:
+    values = config.get(key) or []
+    return {str(value) for value in values}
+
+
+def _depth_supported_relaxation_enabled(
+    *,
+    roi: RoiCandidate,
+    config: dict[str, Any],
+    reference_metric: str,
+    cluster_expected_depths: np.ndarray | None,
+) -> bool:
+    relaxed_ratio = config.get("min_abnormal_ratio_depth_supported")
+    if relaxed_ratio is None:
+        return False
+    if reference_metric != "observed_minus_plane_depth_m":
+        return False
+    allowed_sources = _configured_sources(config, "depth_supported_relaxed_sources")
+    if str(roi.source) not in allowed_sources:
+        return False
+    return cluster_expected_depths is not None and bool(np.any(np.isfinite(cluster_expected_depths)))
+
+
+def _finalize_roi_cluster_trace(trace: dict[str, Any]) -> dict[str, Any]:
+    reason_counts: dict[str, int] = {}
+    cluster_count = 0
+    noise_count = 0
+    dbscan_input_count = 0
+    for sign_trace in trace.get("sign_traces", []):
+        dbscan = sign_trace.get("dbscan") or {}
+        cluster_count += int(dbscan.get("cluster_count", 0) or 0)
+        noise_count += int(dbscan.get("noise_point_count", 0) or 0)
+        dbscan_input_count += int(dbscan.get("input_point_count", 0) or 0)
+        for reason in sign_trace.get("reject_reasons", []):
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+    if int(trace.get("total_point_count", 0) or 0) == 0:
+        reason_counts["no_roi_points"] = reason_counts.get("no_roi_points", 0) + 1
+
+    trace["cluster_count"] = int(cluster_count)
+    trace["dbscan_input_point_count"] = int(dbscan_input_count)
+    trace["dbscan_noise_point_count"] = int(noise_count)
+    trace["candidate_generated"] = bool(trace.get("candidate_count", 0))
+    trace["cluster_reject_reason_counts"] = reason_counts
+    if trace["candidate_generated"]:
+        trace["primary_reject_reason"] = "accepted"
+    else:
+        priority = [
+            "no_roi_points",
+            "too_few_signed_points",
+            "too_few_forward_points",
+            "dbscan_noise_only",
+            "cluster_too_few_forward_points",
+            "abnormal_ratio_too_low",
+            "bbox_area_too_small",
+            "invalid_height_or_width",
+        ]
+        trace["primary_reject_reason"] = next((reason for reason in priority if reason_counts.get(reason, 0) > 0), "too_few_signed_points")
+    return trace
 
 
 def _slice_points_in_roi(
@@ -134,8 +275,39 @@ def _append_clustered_candidates(
     expected_depths_i: np.ndarray | None,
     reference_metric: str,
     positive_is_negative_delta: bool,
+    trace: dict[str, Any] | None = None,
 ) -> int:
-    if int(np.count_nonzero(signed_mask)) < min_cluster_points:
+    signed_point_count = int(np.count_nonzero(signed_mask))
+    min_forward_distance_m = float(config.get("min_forward_distance_m", 0.0))
+    dbscan_eps_m = float(config["dbscan_eps_m"])
+    dbscan_min_samples = int(config["dbscan_min_samples"])
+    sign_trace: dict[str, Any] | None = None
+    if trace is not None:
+        sign_trace = {
+            "sign": obstacle_type,
+            "min_cluster_points": int(min_cluster_points),
+            "min_abnormal_ratio": float(min_abnormal_ratio),
+            "signed_point_count_before_forward_filter": signed_point_count,
+            "forward_distance_filter": {
+                "min_forward_distance_m": min_forward_distance_m,
+                "before_count": signed_point_count,
+                "after_count": 0,
+            },
+            "dbscan": {
+                "input_point_count": 0,
+                "eps_m": dbscan_eps_m,
+                "min_samples": dbscan_min_samples,
+                "cluster_count": 0,
+                "noise_point_count": 0,
+            },
+            "clusters": [],
+            "reject_reasons": [],
+        }
+        trace.setdefault("sign_traces", []).append(sign_trace)
+
+    if signed_point_count < min_cluster_points:
+        if sign_trace is not None:
+            _record_reject(sign_trace, "too_few_signed_points")
         return next_id
 
     signed_world = roi_world[signed_mask]
@@ -144,25 +316,41 @@ def _append_clustered_candidates(
     signed_delta = delta_i[signed_mask]
     signed_expected_depths = expected_depths_i[signed_mask] if expected_depths_i is not None else None
 
-    min_forward_distance_m = float(config.get("min_forward_distance_m", 0.0))
     forward_mask = np.isfinite(signed_world[:, 2]) & (signed_world[:, 2] > min_forward_distance_m)
     signed_world = signed_world[forward_mask]
     signed_image = signed_image[forward_mask]
     signed_depths = signed_depths[forward_mask]
     signed_delta = signed_delta[forward_mask]
     signed_expected_depths = signed_expected_depths[forward_mask] if signed_expected_depths is not None else None
+    if sign_trace is not None:
+        sign_trace["forward_distance_filter"]["after_count"] = int(len(signed_world))
     if len(signed_world) < min_cluster_points:
+        if sign_trace is not None:
+            _record_reject(sign_trace, "too_few_forward_points")
         return next_id
 
     labels = DBSCAN(
-        eps=float(config["dbscan_eps_m"]),
-        min_samples=int(config["dbscan_min_samples"]),
+        eps=dbscan_eps_m,
+        min_samples=dbscan_min_samples,
     ).fit(signed_world[:, [1, 2]]).labels_
+    unique_labels = sorted(set(int(label) for label in labels if int(label) >= 0))
+    noise_point_count = int(np.count_nonzero(labels < 0))
+    if sign_trace is not None:
+        sign_trace["dbscan"] = {
+            "input_point_count": int(len(signed_world)),
+            "eps_m": dbscan_eps_m,
+            "min_samples": dbscan_min_samples,
+            "cluster_count": int(len(unique_labels)),
+            "noise_point_count": noise_point_count,
+        }
+    if not unique_labels:
+        if sign_trace is not None:
+            _record_reject(sign_trace, "dbscan_noise_only")
+        return next_id
+
     min_bbox_area_px = int(config.get("min_bbox_area_px", 0))
 
-    for label in sorted(set(labels)):
-        if label < 0:
-            continue
+    for label in unique_labels:
         cluster_mask = labels == label
         cluster_world = signed_world[cluster_mask]
         cluster_image = signed_image[cluster_mask]
@@ -171,7 +359,32 @@ def _append_clustered_candidates(
         cluster_expected_depths = signed_expected_depths[cluster_mask] if signed_expected_depths is not None else None
         min_valid_forward_points = int(config.get("min_valid_forward_points", min_cluster_points))
         valid_forward = np.isfinite(cluster_world[:, 2]) & (cluster_world[:, 2] > min_forward_distance_m)
+        cluster_record: dict[str, Any] | None = None
+        if sign_trace is not None:
+            cluster_record = {
+                "label": int(label),
+                "point_count": int(np.count_nonzero(cluster_mask)),
+                "valid_forward_point_count": int(np.count_nonzero(valid_forward)),
+                "image_bbox": _cluster_bbox(cluster_image) if len(cluster_image) else None,
+                "padded_bbox": None,
+                "world_y_range_m": _finite_range(cluster_world[:, 1]) if len(cluster_world) else None,
+                "world_z_range_m": _finite_range(cluster_world[:, 2]) if len(cluster_world) else None,
+                "abnormal_ratio": None,
+                "height_m": None,
+                "width_m": None,
+                "bbox_area_px": None,
+                "bbox_decision": None,
+                "accepted": False,
+                "candidate_generated": False,
+                "candidate_id": None,
+                "reject_reason": None,
+            }
+            sign_trace.setdefault("clusters", []).append(cluster_record)
         if int(np.count_nonzero(valid_forward)) < min_valid_forward_points:
+            if cluster_record is not None:
+                cluster_record["reject_reason"] = "cluster_too_few_forward_points"
+            if sign_trace is not None:
+                _record_reject(sign_trace, "cluster_too_few_forward_points")
             continue
         cluster_world = cluster_world[valid_forward]
         cluster_image = cluster_image[valid_forward]
@@ -179,10 +392,36 @@ def _append_clustered_candidates(
         cluster_delta = cluster_delta[valid_forward]
         cluster_expected_depths = cluster_expected_depths[valid_forward] if cluster_expected_depths is not None else None
         if len(cluster_world) < min_cluster_points:
+            if cluster_record is not None:
+                cluster_record["reject_reason"] = "cluster_too_few_forward_points"
+                cluster_record["valid_forward_point_count"] = int(len(cluster_world))
+            if sign_trace is not None:
+                _record_reject(sign_trace, "cluster_too_few_forward_points")
             continue
 
         abnormal_ratio = float(len(cluster_world) / max(1, len(roi_world)))
-        if abnormal_ratio < min_abnormal_ratio:
+        effective_min_abnormal_ratio = float(min_abnormal_ratio)
+        depth_supported_relaxed = _depth_supported_relaxation_enabled(
+            roi=roi,
+            config=config,
+            reference_metric=reference_metric,
+            cluster_expected_depths=cluster_expected_depths,
+        )
+        if depth_supported_relaxed:
+            effective_min_abnormal_ratio = min(
+                effective_min_abnormal_ratio,
+                float(config.get("min_abnormal_ratio_depth_supported", effective_min_abnormal_ratio)),
+            )
+        if cluster_record is not None:
+            cluster_record["abnormal_ratio"] = abnormal_ratio
+            cluster_record["min_abnormal_ratio"] = float(min_abnormal_ratio)
+            cluster_record["effective_min_abnormal_ratio"] = effective_min_abnormal_ratio
+            cluster_record["depth_supported_relaxed"] = bool(depth_supported_relaxed)
+        if abnormal_ratio < effective_min_abnormal_ratio:
+            if cluster_record is not None:
+                cluster_record["reject_reason"] = "abnormal_ratio_too_low"
+            if sign_trace is not None:
+                _record_reject(sign_trace, "abnormal_ratio_too_low")
             continue
 
         if obstacle_type == "positive":
@@ -197,21 +436,55 @@ def _append_clustered_candidates(
         anchor[2] = distance_m
         cluster_bbox = _cluster_bbox(cluster_image)
         padded_cluster_bbox = _pad_bbox_within_bounds(cluster_bbox, roi.bbox, config)
-        bbox = list(roi.bbox) if bool(config.get("use_roi_bbox_for_depth_roi", False)) and roi.source == "depth_residual_contour" else padded_cluster_bbox
+        use_roi_bbox = bool(config.get("use_roi_bbox_for_depth_roi", False)) and roi.source == "depth_residual_contour"
+        bbox = list(roi.bbox) if use_roi_bbox else padded_cluster_bbox
         bbox_area = int(max(1, bbox[2] * bbox[3]))
+        if cluster_record is not None:
+            cluster_record["image_bbox"] = list(cluster_bbox)
+            cluster_record["padded_bbox"] = list(padded_cluster_bbox)
+            cluster_record["bbox_area_px"] = bbox_area
+            cluster_record["bbox_decision"] = {
+                "cluster_bbox": list(cluster_bbox),
+                "padded_cluster_bbox": list(padded_cluster_bbox),
+                "roi_bbox": list(roi.bbox),
+                "final_bbox": list(bbox),
+                "use_roi_bbox_for_depth_roi": bool(use_roi_bbox),
+            }
         if bbox_area < min_bbox_area_px:
+            if cluster_record is not None:
+                cluster_record["reject_reason"] = "bbox_area_too_small"
+            if sign_trace is not None:
+                _record_reject(sign_trace, "bbox_area_too_small")
             continue
         z_range = [float(np.min(cluster_world[:, 2])), float(np.max(cluster_world[:, 2]))]
         width_m = float(np.max(cluster_world[:, 1]) - np.min(cluster_world[:, 1])) if len(cluster_world) else 0.0
+        if cluster_record is not None:
+            cluster_record["height_m"] = height_m
+            cluster_record["width_m"] = width_m
+            cluster_record["world_y_range_m"] = _finite_range(cluster_world[:, 1])
+            cluster_record["world_z_range_m"] = z_range
         max_valid_height_m = _optional_float(config, "max_valid_height_m")
         max_valid_width_m = _optional_float(config, "max_valid_width_m")
         if not _valid_dimension(height_m, max_valid_height_m) or not _valid_dimension(width_m, max_valid_width_m):
+            if cluster_record is not None:
+                cluster_record["reject_reason"] = "invalid_height_or_width"
+            if sign_trace is not None:
+                _record_reject(sign_trace, "invalid_height_or_width")
             continue
         centroid_2d = cluster_image.mean(axis=0).round(3).tolist()
+        candidate_id = f"cand_{next_id:03d}"
+        if cluster_record is not None:
+            cluster_record["accepted"] = True
+            cluster_record["candidate_generated"] = True
+            cluster_record["candidate_id"] = candidate_id
+            cluster_record["reject_reason"] = "accepted"
+        if trace is not None:
+            trace["candidate_count"] = int(trace.get("candidate_count", 0)) + 1
+            trace.setdefault("candidate_ids", []).append(candidate_id)
 
         observations.append(
             CandidateObservation(
-                candidate_id=f"cand_{next_id:03d}",
+                candidate_id=candidate_id,
                 roi_id=roi.roi_id,
                 obstacle_type=obstacle_type,
                 bbox=bbox,
@@ -230,6 +503,8 @@ def _append_clustered_candidates(
                     "raw_bbox": list((roi.metadata or {}).get("raw_bbox", roi.bbox)),
                     "cluster_bbox": list(cluster_bbox),
                     "padded_cluster_bbox": list(padded_cluster_bbox),
+                    "final_bbox": list(bbox),
+                    "use_roi_bbox_for_depth_roi": bool(use_roi_bbox),
                     "roi_source": roi.source,
                     "roi_area_px": roi.area_px,
                     "bbox_area_px": bbox_area,
@@ -453,7 +728,9 @@ def build_candidate_observations(
     min_abnormal_ratio_pos = float(config.get("min_abnormal_ratio_pos", min_abnormal_ratio_default))
     min_abnormal_ratio_neg = float(config.get("min_abnormal_ratio_neg", min_abnormal_ratio_default))
 
-    observations: list[CandidateObservation] = []
+    observations: list[CandidateObservation] = _CandidateObservationList()
+    trace_enabled = bool(config.get("trace_roi_clusters", True))
+    roi_cluster_traces: list[dict[str, Any]] = []
     next_id = 0
 
     height_reference = str(config.get("height_reference", "depth_residual_to_plane")).lower()
@@ -495,16 +772,26 @@ def build_candidate_observations(
         roi_depths = sliced["depths_m"]
         roi_expected_depths = sliced.get("expected_depths_m")
         delta_i = sliced.get("residuals_m")
-        if len(roi_world) == 0 or delta_i is None:
-            continue
-
-        valid_delta = np.isfinite(delta_i)
-        if positive_is_negative_delta:
+        valid_delta = np.isfinite(delta_i) if delta_i is not None else np.zeros((len(roi_world),), dtype=bool)
+        if delta_i is not None and positive_is_negative_delta:
             positive_mask = valid_delta & (delta_i < -h_pos_m)
             negative_mask = valid_delta & (delta_i > h_neg_m)
-        else:
+        elif delta_i is not None:
             positive_mask = valid_delta & (delta_i > h_pos_m)
             negative_mask = valid_delta & (delta_i < -h_neg_m)
+        else:
+            positive_mask = np.zeros((len(roi_world),), dtype=bool)
+            negative_mask = np.zeros((len(roi_world),), dtype=bool)
+
+        trace = (
+            _new_roi_cluster_trace(roi, roi_image, roi_world, delta_i, positive_mask, negative_mask, config)
+            if trace_enabled
+            else None
+        )
+        if len(roi_world) == 0 or delta_i is None:
+            if trace is not None:
+                roi_cluster_traces.append(_finalize_roi_cluster_trace(trace))
+            continue
 
         next_id = _append_clustered_candidates(
             observations=observations,
@@ -522,6 +809,7 @@ def build_candidate_observations(
             expected_depths_i=roi_expected_depths,
             reference_metric=reference_metric,
             positive_is_negative_delta=positive_is_negative_delta,
+            trace=trace,
         )
         next_id = _append_clustered_candidates(
             observations=observations,
@@ -539,8 +827,13 @@ def build_candidate_observations(
             expected_depths_i=roi_expected_depths,
             reference_metric=reference_metric,
             positive_is_negative_delta=positive_is_negative_delta,
+            trace=trace,
         )
+        if trace is not None:
+            roi_cluster_traces.append(_finalize_roi_cluster_trace(trace))
 
+    if trace_enabled:
+        setattr(observations, "roi_cluster_traces", roi_cluster_traces)
     return observations
 
 

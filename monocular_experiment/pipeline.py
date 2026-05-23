@@ -531,6 +531,7 @@ def run_pipeline(
             intrinsics=intrinsics,
             extrinsics=extrinsics,
         )
+        roi_cluster_traces = list(getattr(candidate_clusters, "roi_cluster_traces", []))
         candidate_clusters = classify_all_candidates(
             candidates=candidate_clusters,
             road_mask=frontend.road_mask,
@@ -616,6 +617,15 @@ def run_pipeline(
         road_mask_stats["frontend_roi_diagnostics"] = _export_roi_diagnostics(frontend.roi_candidates)
         road_mask_stats["depth_roi_diagnostics"] = _export_roi_diagnostics(depth_roi_candidates)
         road_mask_stats["selected_roi_diagnostics"] = _export_roi_diagnostics(roi_candidates_for_candidates)
+        road_mask_stats["selected_roi_cluster_traces"] = roi_cluster_traces
+        cluster_reject_reason_counts: dict[str, int] = {}
+        for trace in roi_cluster_traces:
+            for reason, count in (trace.get("cluster_reject_reason_counts") or {}).items():
+                cluster_reject_reason_counts[str(reason)] = cluster_reject_reason_counts.get(str(reason), 0) + int(count)
+        road_mask_stats["cluster_reject_reason_counts"] = cluster_reject_reason_counts
+        road_mask_stats["selected_roi_to_candidate_success_count"] = sum(
+            1 for trace in roi_cluster_traces if trace.get("candidate_generated")
+        )
         road_mask_stats["candidate_object_id_count"] = sum(1 for item in candidate_clusters if item.object_id)
         road_mask_stats["stable_object_id_count"] = len({item.object_id for item in candidate_clusters if item.object_id})
         road_mask_stats["temporal_keyframe_count"] = temporal_manager.keyframe_count()

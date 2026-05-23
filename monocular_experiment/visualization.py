@@ -138,6 +138,85 @@ def save_overlay(
     cv2.imwrite(str(output_path), canvas)
 
 
+def _draw_xywh(canvas: np.ndarray, bbox: Any, color: tuple[int, int, int], thickness: int = 1) -> None:
+    if not bbox:
+        return
+    x, y, w, h = [int(value) for value in list(bbox)[:4]]
+    if w <= 0 or h <= 0:
+        return
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), color, thickness)
+
+
+def _put_label(canvas: np.ndarray, text: str, xy: tuple[int, int], color: tuple[int, int, int]) -> None:
+    x, y = xy
+    cv2.putText(canvas, text[:80], (int(x), max(12, int(y))), cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
+
+
+def save_roi_to_cluster_trace_overlay(
+    frame_bgr: np.ndarray,
+    frame_id: str,
+    gt_bbox: list[int],
+    selected_roi: dict[str, Any] | None,
+    trace: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    output_path: str | Path,
+) -> None:
+    canvas = frame_bgr.copy()
+    _draw_xywh(canvas, gt_bbox, (0, 0, 255), 2)
+    _put_label(canvas, f"GT label07 {frame_id}", (gt_bbox[0], gt_bbox[1] - 6), (0, 0, 255))
+
+    if selected_roi:
+        roi_bbox = selected_roi.get("bbox") or []
+        _draw_xywh(canvas, roi_bbox, (0, 165, 255), 2)
+        _put_label(
+            canvas,
+            f"ROI {selected_roi.get('roi_id', '')} {selected_roi.get('source', '')}",
+            (int(roi_bbox[0]) if roi_bbox else 8, int(roi_bbox[1]) - 18 if roi_bbox else 36),
+            (0, 165, 255),
+        )
+
+    if trace:
+        for point in trace.get("positive_abnormal_image_points_sample") or []:
+            cv2.circle(canvas, (int(point[0]), int(point[1])), 2, (255, 0, 0), -1)
+        for point in trace.get("negative_abnormal_image_points_sample") or []:
+            cv2.circle(canvas, (int(point[0]), int(point[1])), 2, (0, 255, 255), -1)
+        for sign_trace in trace.get("sign_traces") or []:
+            sign = sign_trace.get("sign", "")
+            for cluster in sign_trace.get("clusters") or []:
+                bbox = cluster.get("image_bbox")
+                accepted = bool(cluster.get("accepted"))
+                color = (0, 255, 0) if accepted else (180, 180, 180)
+                _draw_xywh(canvas, bbox, color, 1)
+                if bbox:
+                    reason = cluster.get("reject_reason") or "unknown"
+                    _put_label(canvas, f"{sign} {reason}", (int(bbox[0]), int(bbox[1]) - 4), color)
+                padded = cluster.get("padded_bbox")
+                if padded and not accepted:
+                    _draw_xywh(canvas, padded, (120, 120, 120), 1)
+                decision = cluster.get("bbox_decision") or {}
+                final_bbox = decision.get("final_bbox")
+                if accepted and final_bbox:
+                    _draw_xywh(canvas, final_bbox, (0, 255, 0), 2)
+
+    for candidate in candidates:
+        metadata = candidate.get("metadata") or {}
+        bbox = candidate.get("bbox") or metadata.get("bbox")
+        _draw_xywh(canvas, bbox, (0, 255, 0), 2)
+        if bbox:
+            _put_label(canvas, str(candidate.get("candidate_id", "cand")), (int(bbox[0]), int(bbox[1]) + int(bbox[3]) + 12), (0, 255, 0))
+
+    if trace:
+        text = (
+            f"reject={trace.get('primary_reject_reason', '')} pts={trace.get('total_point_count', 0)} "
+            f"valid={trace.get('valid_residual_point_count', 0)} clusters={trace.get('cluster_count', 0)}"
+        )
+        _put_label(canvas, text, (8, 22), (255, 255, 255))
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), canvas)
+
+
 def plot_confusion_matrix(matrix: np.ndarray, labels: list[str], title: str, output_path: str | Path) -> None:
     fig, ax = plt.subplots(figsize=(5, 4))
     im = ax.imshow(matrix, cmap="Blues")

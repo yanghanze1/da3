@@ -7,8 +7,13 @@ import numpy as np
 import pandas as pd
 import json
 
-from .io_utils import read_gt_obstacles, read_gt_plane, read_jsonl
-from .visualization import plot_confusion_matrix, plot_geometry_error_scatter, plot_latency_histogram
+from .io_utils import list_frame_paths, read_gt_obstacles, read_gt_plane, read_image, read_jsonl
+from .visualization import (
+    plot_confusion_matrix,
+    plot_geometry_error_scatter,
+    plot_latency_histogram,
+    save_roi_to_cluster_trace_overlay,
+)
 
 RISK_ORDER = {"omega0": 0, "omega1": 1, "omega2": 2}
 
@@ -138,6 +143,7 @@ def _best_bbox_iou(gt_bbox: list[int], items: list[dict[str, Any]], *, skip_reti
     best_iou = 0.0
     best_id = ""
     best_state = ""
+    best_item: dict[str, Any] | None = None
     for item in items:
         if skip_retired and item.get("state") == "retired":
             continue
@@ -149,7 +155,87 @@ def _best_bbox_iou(gt_bbox: list[int], items: list[dict[str, Any]], *, skip_reti
             best_iou = score
             best_id = str(item.get("roi_id") or item.get("candidate_id") or item.get("object_id") or "")
             best_state = str(item.get("state") or "")
-    return {"iou": float(best_iou), "id": best_id, "state": best_state, "hit": bool(best_iou > 0.0)}
+            best_item = item
+    return {"iou": float(best_iou), "id": best_id, "state": best_state, "hit": bool(best_iou > 0.0), "item": best_item}
+
+
+def _find_trace_for_roi(stats: dict[str, Any], roi_id: str) -> dict[str, Any] | None:
+    for trace in stats.get("selected_roi_cluster_traces") or []:
+        if str(trace.get("roi_id") or "") == str(roi_id):
+            return trace
+    return None
+
+
+def _bbox_to_text(bbox: Any) -> str:
+    if not bbox:
+        return ""
+    return ";".join(str(int(value)) for value in list(bbox)[:4])
+
+
+def _trace_reject_reason_counts_text(trace: dict[str, Any] | None) -> str:
+    if not trace:
+        return ""
+    counts = trace.get("cluster_reject_reason_counts") or {}
+    return ";".join(f"{key}:{int(value)}" for key, value in sorted(counts.items()))
+
+
+def _write_label_roi_to_candidate_failures(
+    rows: list[dict[str, Any]],
+    frame_states: list[dict[str, Any]],
+    label: str,
+    tables_dir: Path,
+) -> list[dict[str, Any]]:
+    failure_rows: list[dict[str, Any]] = []
+    by_frame = {str(frame_state.get("frame_id")): frame_state for frame_state in frame_states}
+    for row in rows:
+        selected_iou = float(row.get("selected_roi_best_iou", 0.0) or 0.0)
+        candidate_iou = float(row.get("candidate_best_iou", 0.0) or 0.0)
+        is_failure = (selected_iou > 0.0 and candidate_iou == 0.0) or (
+            selected_iou >= 0.1 and candidate_iou < selected_iou * 0.3
+        )
+        if not is_failure:
+            continue
+        frame_state = by_frame.get(str(row.get("frame_id")), {})
+        stats = frame_state.get("road_mask_stats") or {}
+        trace = _find_trace_for_roi(stats, str(row.get("selected_roi_best_id") or ""))
+        selected_item = row.get("selected_roi_best_item") or {}
+        candidate_item = row.get("candidate_best_item") or {}
+        failure_rows.append(
+            {
+                "frame_id": row.get("frame_id", ""),
+                "object_id": row.get("object_id", ""),
+                "label": str(label),
+                "gt_bbox": _bbox_to_text(row.get("gt_bbox")),
+                "selected_roi_id": row.get("selected_roi_best_id", ""),
+                "selected_roi_source": selected_item.get("source", ""),
+                "selected_roi_bbox": _bbox_to_text(selected_item.get("bbox")),
+                "selected_roi_best_iou": selected_iou,
+                "candidate_id": row.get("candidate_best_id", ""),
+                "candidate_bbox": _bbox_to_text(
+                    candidate_item.get("bbox") or (candidate_item.get("metadata") or {}).get("bbox")
+                ),
+                "candidate_best_iou": candidate_iou,
+                "tracked_best_iou": float(row.get("tracked_best_iou", 0.0) or 0.0),
+                "tracked_best_id": row.get("tracked_best_id", ""),
+                "tracked_best_state": row.get("tracked_best_state", ""),
+                "main_reject_reason": (trace or {}).get("primary_reject_reason", "missing_trace"),
+                "trace_candidate_generated": bool((trace or {}).get("candidate_generated", False)),
+                "trace_candidate_count": int((trace or {}).get("candidate_count", 0) or 0),
+                "trace_candidate_ids": ";".join(str(value) for value in (trace or {}).get("candidate_ids", [])),
+                "roi_total_point_count": int((trace or {}).get("total_point_count", 0) or 0),
+                "roi_valid_residual_point_count": int((trace or {}).get("valid_residual_point_count", 0) or 0),
+                "roi_positive_abnormal_point_count": int((trace or {}).get("positive_abnormal_point_count", 0) or 0),
+                "roi_negative_abnormal_point_count": int((trace or {}).get("negative_abnormal_point_count", 0) or 0),
+                "dbscan_input_point_count": int((trace or {}).get("dbscan_input_point_count", 0) or 0),
+                "cluster_count": int((trace or {}).get("cluster_count", 0) or 0),
+                "dbscan_noise_point_count": int((trace or {}).get("dbscan_noise_point_count", 0) or 0),
+                "cluster_reject_reason_counts": _trace_reject_reason_counts_text(trace),
+            }
+        )
+    failure_df = pd.DataFrame(failure_rows)
+    if not failure_df.empty:
+        failure_df.to_csv(tables_dir / f"label_{label}_roi_to_candidate_failures.csv", index=False)
+    return failure_rows
 
 
 def _label_layer_diagnostics(
@@ -192,20 +278,33 @@ def _label_layer_diagnostics(
                 miss_layer = name
                 break
         miss_layer_counts[miss_layer] = miss_layer_counts.get(miss_layer, 0) + 1
+        selected_trace = _find_trace_for_roi(stats, layer_hits["selected_roi"]["id"])
         rows.append(
             {
                 "frame_id": frame_id,
                 "object_id": str(gt["object_id"]),
                 "label": str(label),
+                "gt_bbox": gt_bbox,
                 "miss_layer": miss_layer,
                 **{f"{name}_hit": layer_hits[name]["hit"] for name in layer_names},
                 **{f"{name}_best_iou": layer_hits[name]["iou"] for name in layer_names},
                 **{f"{name}_best_id": layer_hits[name]["id"] for name in layer_names},
+                **{f"{name}_best_item": layer_hits[name]["item"] for name in layer_names},
+                "selected_roi_cluster_primary_reject_reason": (selected_trace or {}).get("primary_reject_reason", ""),
+                "selected_roi_cluster_count": int((selected_trace or {}).get("cluster_count", 0) or 0),
+                "selected_roi_dbscan_input_point_count": int((selected_trace or {}).get("dbscan_input_point_count", 0) or 0),
+                "selected_roi_total_point_count": int((selected_trace or {}).get("total_point_count", 0) or 0),
+                "selected_roi_valid_residual_point_count": int((selected_trace or {}).get("valid_residual_point_count", 0) or 0),
                 "tracked_best_state": layer_hits["tracked"]["state"],
             }
         )
 
-    diag_df = pd.DataFrame(rows)
+    failure_rows = _write_label_roi_to_candidate_failures(rows, frame_states, str(label), tables_dir)
+    csv_rows = [
+        {key: value for key, value in row.items() if not key.endswith("_best_item")}
+        for row in rows
+    ]
+    diag_df = pd.DataFrame(csv_rows)
     if not diag_df.empty:
         diag_df.to_csv(tables_dir / f"label_{label}_layer_diagnostics.csv", index=False)
     total = int(len(rows))
@@ -222,7 +321,64 @@ def _label_layer_diagnostics(
             name: float(diag_df[f"{name}_best_iou"].max()) if not diag_df.empty else 0.0
             for name in layer_names
         },
+        "roi_to_candidate_failure_count": int(len(failure_rows)),
+        "_roi_to_candidate_failure_rows": failure_rows,
     }
+
+
+def _parse_bbox_text(text: Any) -> list[int]:
+    if isinstance(text, list):
+        return [int(value) for value in text[:4]]
+    if not text:
+        return [0, 0, 0, 0]
+    parts = str(text).replace(",", ";").split(";")
+    bbox = [int(float(part)) for part in parts[:4] if part != ""]
+    while len(bbox) < 4:
+        bbox.append(0)
+    return bbox
+
+
+def _frame_image_map(dataset_dir: Path) -> dict[str, Path]:
+    return {path.stem: path for path in list_frame_paths(dataset_dir / "frames")}
+
+
+def _export_roi_to_candidate_failure_overlays(
+    dataset_dir: Path,
+    output_dir: Path,
+    frame_states: list[dict[str, Any]],
+    failure_rows: list[dict[str, Any]],
+) -> None:
+    if not failure_rows:
+        return
+    frame_paths = _frame_image_map(dataset_dir)
+    by_frame = {str(frame_state.get("frame_id")): frame_state for frame_state in frame_states}
+    overlay_dir = output_dir / "roi_to_candidate_trace_overlays"
+    for row in failure_rows:
+        frame_id = str(row.get("frame_id", ""))
+        frame_path = frame_paths.get(frame_id)
+        if frame_path is None:
+            continue
+        frame_state = by_frame.get(frame_id, {})
+        stats = frame_state.get("road_mask_stats") or {}
+        selected_roi_id = str(row.get("selected_roi_id") or "")
+        selected_roi = next(
+            (
+                item
+                for item in stats.get("selected_roi_diagnostics") or []
+                if str(item.get("roi_id") or "") == selected_roi_id
+            ),
+            None,
+        )
+        trace = _find_trace_for_roi(stats, selected_roi_id)
+        save_roi_to_cluster_trace_overlay(
+            frame_bgr=read_image(frame_path),
+            frame_id=frame_id,
+            gt_bbox=_parse_bbox_text(row.get("gt_bbox")),
+            selected_roi=selected_roi,
+            trace=trace,
+            candidates=frame_state.get("candidate_clusters") or [],
+            output_path=overlay_dir / f"{frame_id}_{row.get('object_id', '')}_label07_trace.png",
+        )
 
 
 def _temporal_measurement_metrics(frame_states: list[dict[str, Any]]) -> dict[str, Any]:
@@ -368,6 +524,17 @@ def evaluate_pipeline(dataset_dir: str | Path, output_dir: str | Path, config: d
     label_diagnostics = {
         "07": _label_layer_diagnostics(gt_df, frame_states, "07", tables_dir),
     }
+    for label_summary in label_diagnostics.values():
+        _export_roi_to_candidate_failure_overlays(
+            dataset_dir=dataset_dir,
+            output_dir=output_dir,
+            frame_states=frame_states,
+            failure_rows=label_summary.get("_roi_to_candidate_failure_rows", []),
+        )
+    label_diagnostics_for_summary = {
+        label_key: {key: value for key, value in label_summary.items() if not key.startswith("_")}
+        for label_key, label_summary in label_diagnostics.items()
+    }
 
     summary = {
         "detection_metrics": detection,
@@ -378,7 +545,7 @@ def evaluate_pipeline(dataset_dir: str | Path, output_dir: str | Path, config: d
         "tracking_metrics": tracking_metrics,
         "latency_metrics": latency_metrics,
         "temporal_measurement_metrics": temporal_metrics,
-        "label_layer_diagnostics": label_diagnostics,
+        "label_layer_diagnostics": label_diagnostics_for_summary,
     }
 
     plot_confusion_matrix(
