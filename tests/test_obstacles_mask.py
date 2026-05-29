@@ -489,6 +489,113 @@ class ObstacleValidationTests(unittest.TestCase):
         self.assertEqual(clusters[0].obstacle_type, "negative")
         self.assertGreater(clusters[0].height_m, 0.05)
 
+    def test_depth_gradient_roi_detects_depth_step_inside_road_mask(self) -> None:
+        depth = np.full((80, 100), 4.0, dtype=np.float32)
+        depth[34:50, 42:58] = 2.0
+        image = np.zeros((80, 100, 3), dtype=np.uint8)
+        analysis_mask = np.ones((80, 100), dtype=bool)
+        road_mask = np.ones((80, 100), dtype=bool)
+
+        rois = obstacles.build_depth_gradient_contour_roi_candidates(
+            image=image,
+            absolute_depth_map=depth,
+            relative_depth_map=None,
+            analysis_mask=analysis_mask,
+            road_mask=road_mask,
+            config={
+                "depth_gradient_contour_roi": {
+                    "enabled": True,
+                    "depth_source": "absolute",
+                    "use_inverse_depth": False,
+                    "use_color_edges": False,
+                    "depth_gradient_percentile": 90.0,
+                    "min_depth_gradient": 0.01,
+                    "min_component_area_px": 8,
+                    "min_bbox_width_px": 4,
+                    "min_bbox_height_px": 4,
+                    "bbox_expand_px": 0,
+                    "morph_close_kernel": 3,
+                    "morph_dilate_kernel": 3,
+                    "morph_dilate_iterations": 1,
+                    "morph_open_kernel": 0,
+                    "road_prior": {"enabled": True, "dilate_px": 5, "min_overlap_ratio": 0.01},
+                }
+            },
+        )
+
+        self.assertGreaterEqual(len(rois), 1)
+        roi = rois[0]
+        self.assertEqual(roi.source, "depth_gradient_contour")
+        self.assertEqual(roi.metadata["sources"], ["depth_gradient_contour"])
+        self.assertEqual(roi.metadata["depth_source_used"], "absolute")
+        self.assertGreater(roi.metadata["depth_gradient_score"], 0.0)
+        self.assertGreater(roi.metadata["road_prior_overlap_ratio"], 0.0)
+        x, y, w, h = roi.bbox
+        self.assertLessEqual(x, 42)
+        self.assertLessEqual(y, 34)
+        self.assertGreaterEqual(x + w, 58)
+        self.assertGreaterEqual(y + h, 50)
+
+    def test_depth_gradient_roi_ignores_invalid_depth_boundary(self) -> None:
+        depth = np.full((50, 60), 3.0, dtype=np.float32)
+        depth[20:30, 25:35] = np.nan
+        analysis_mask = np.ones((50, 60), dtype=bool)
+
+        rois = obstacles.build_depth_gradient_contour_roi_candidates(
+            image=None,
+            absolute_depth_map=depth,
+            relative_depth_map=None,
+            analysis_mask=analysis_mask,
+            road_mask=np.ones((50, 60), dtype=bool),
+            config={
+                "depth_gradient_contour_roi": {
+                    "enabled": True,
+                    "use_color_edges": False,
+                    "depth_gradient_percentile": 90.0,
+                    "min_depth_gradient": 0.01,
+                    "min_component_area_px": 1,
+                    "morph_close_kernel": 1,
+                    "morph_dilate_kernel": 1,
+                    "morph_dilate_iterations": 0,
+                    "morph_open_kernel": 0,
+                    "road_prior": {"enabled": True, "dilate_px": 3, "min_overlap_ratio": 0.0},
+                }
+            },
+        )
+
+        self.assertEqual(rois, [])
+
+    def test_gradient_roi_source_priority_preempts_hybrid_roi(self) -> None:
+        gradient_roi = models.RoiCandidate(
+            roi_id="gradient_000",
+            bbox=[10, 10, 20, 20],
+            area_px=400,
+            touch_border=False,
+            source="depth_gradient_contour",
+        )
+        frontend_roi = models.RoiCandidate(
+            roi_id="frontend_000",
+            bbox=[10, 10, 20, 20],
+            area_px=400,
+            touch_border=False,
+            source="hybrid",
+        )
+
+        selected = pipeline._select_roi_candidates_for_obstacles(
+            frontend_rois=[frontend_roi],
+            depth_roi_candidates=[gradient_roi],
+            candidate_cfg={
+                "depth_contour_roi": {
+                    "enabled": True,
+                    "selection_mode": "union",
+                    "deduplicate_iou_threshold": 0.7,
+                },
+                "depth_gradient_contour_roi": {"enabled": True},
+            },
+        )
+
+        self.assertEqual([item.roi_id for item in selected], ["gradient_000"])
+
     def test_da3_only_mode_does_not_fallback_to_frontend_rois(self) -> None:
         frontend_roi = models.RoiCandidate(
             roi_id="frontend_000",
@@ -660,6 +767,23 @@ class ObstacleValidationTests(unittest.TestCase):
         self.assertEqual(source, "processing_roi")
         self.assertTrue(np.array_equal(resolved_mask, obstacle_mask))
         self.assertFalse(np.array_equal(resolved_mask, analysis_mask))
+
+    def test_obstacle_analysis_mask_accepts_foe_triangle_processing_roi(self) -> None:
+        analysis_mask = np.zeros((30, 30), dtype=bool)
+        obstacle_mask = np.tri(30, 30, dtype=bool)
+        frontend = type(
+            "FrontendLike",
+            (),
+            {
+                "analysis_mask": analysis_mask,
+                "obstacle_analysis_mask": obstacle_mask,
+                "processing_roi": {"effective_mode": "foe_road_triangle"},
+            },
+        )()
+
+        resolved_mask, source = pipeline._resolve_obstacle_analysis_mask(frontend)
+        self.assertEqual(source, "processing_roi")
+        self.assertTrue(np.array_equal(resolved_mask, obstacle_mask))
 
     def test_cross_frame_summary_prefers_geometry_consistent_match(self) -> None:
         prev_candidate = models.CandidateObservation(

@@ -92,7 +92,7 @@ def _fit_plane_ransac_rel(
     # SVD refine on inliers
     inliers = points[best_mask]
     centroid = inliers.mean(axis=0)
-    _, _, vh = np.linalg.svd(inliers - centroid)
+    _, _, vh = np.linalg.svd(inliers - centroid, full_matrices=False)
     normal = vh[-1]
     if normal[0] < 0:
         normal = -normal

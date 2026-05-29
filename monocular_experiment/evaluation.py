@@ -10,6 +10,7 @@ import json
 from .io_utils import list_frame_paths, read_gt_obstacles, read_gt_plane, read_image, read_jsonl
 from .visualization import (
     plot_confusion_matrix,
+    plot_evaluation_summary_figure,
     plot_geometry_error_scatter,
     plot_latency_histogram,
     save_roi_to_cluster_trace_overlay,
@@ -418,8 +419,13 @@ def evaluate_pipeline(dataset_dir: str | Path, output_dir: str | Path, config: d
     output_dir = Path(output_dir)
     tables_dir = output_dir / "tables"
     plots_dir = output_dir / "plots"
+    visualization_cfg = dict(config.get("visualization", {}))
+    figures_dir = output_dir / str(visualization_cfg.get("step_figures_dir", "figures"))
+    save_plots = bool(visualization_cfg.get("save_plots", True))
     tables_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
+    if save_plots:
+        figures_dir.mkdir(parents=True, exist_ok=True)
 
     frame_states = read_jsonl(output_dir / "frame_states.jsonl")
     gt_df = read_gt_obstacles(dataset_dir / "gt_obstacles.csv")
@@ -548,14 +554,16 @@ def evaluate_pipeline(dataset_dir: str | Path, output_dir: str | Path, config: d
         "label_layer_diagnostics": label_diagnostics_for_summary,
     }
 
-    plot_confusion_matrix(
-        matrix=risk_conf,
-        labels=["omega0", "omega1", "omega2"],
-        title="Risk Confusion Matrix",
-        output_path=plots_dir / "risk_confusion_matrix.png",
-    )
-    plot_geometry_error_scatter(geom_df, plots_dir / "geometry_error_scatter.png")
-    plot_latency_histogram(timing_ms, plots_dir / "latency_histogram.png")
+    if save_plots:
+        plot_confusion_matrix(
+            matrix=risk_conf,
+            labels=["omega0", "omega1", "omega2"],
+            title="Risk Confusion Matrix",
+            output_path=plots_dir / "risk_confusion_matrix.png",
+        )
+        plot_geometry_error_scatter(geom_df, plots_dir / "geometry_error_scatter.png")
+        plot_latency_histogram(timing_ms, plots_dir / "latency_histogram.png")
+        plot_evaluation_summary_figure(summary, figures_dir / "fig20_evaluation_summary.png")
 
     (output_dir / "evaluation_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=True),

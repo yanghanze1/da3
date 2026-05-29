@@ -191,6 +191,54 @@ class SegmentationTests(unittest.TestCase):
         self.assertTrue(np.array_equal(result.road_mask, base.road_mask))
         self.assertTrue(np.array_equal(result.analysis_mask, base.analysis_mask))
 
+    def test_dynamic_foe_processing_roi_builds_obstacle_mask(self) -> None:
+        frame = np.zeros((120, 200, 3), dtype=np.uint8)
+        frame[45:, :] = 110
+        cfg = self._base_cfg(mode="negative_space")
+        cfg["processing_rect"] = {
+            "enabled": True,
+            "mode": "foe_road_triangle",
+            "fallback_mode": "trapezoid",
+            "normalized_bbox_xywh": [0.25, 0.30, 0.50, 0.60],
+            "obstacle_analysis_mask": "processing_roi",
+            "restrict_analysis_mask": False,
+            "restrict_road_mask": False,
+        }
+        dynamic_roi = {
+            "status": "ok",
+            "source": "foe_road_triangle",
+            "polygon": [[100, 25], [180, 119], [20, 119]],
+            "bbox": [20, 25, 161, 95],
+            "foe": {"smoothed": [100.0, 25.0]},
+            "road_edges": {
+                "left": {"endpoints": [[80, 60], [20, 119]]},
+                "right": {"endpoints": [[120, 60], [180, 119]]},
+            },
+        }
+
+        result = segmentation.segment_frame(frame, cfg, dynamic_processing_roi=dynamic_roi)
+        expected_mask = segmentation.polygon_to_mask(frame.shape, dynamic_roi["polygon"])
+        self.assertTrue(np.array_equal(result.obstacle_analysis_mask, expected_mask))
+        self.assertEqual(result.processing_roi["effective_mode"], "foe_road_triangle")
+        self.assertEqual(result.processing_roi["foe_road_triangle"]["source"], "foe_road_triangle")
+
+    def test_foe_processing_roi_falls_back_to_trapezoid(self) -> None:
+        cfg = {
+            "processing_rect": {
+                "enabled": True,
+                "mode": "foe_road_triangle",
+                "fallback_mode": "trapezoid",
+                "normalized_bbox_xywh": [0.1, 0.25, 0.5, 0.5],
+            }
+        }
+
+        roi = segmentation.resolve_processing_roi((100, 200, 3), cfg, dynamic_roi={"status": "fallback", "reason": "no_previous_frame"})
+
+        self.assertEqual(roi["mode"], "foe_road_triangle")
+        self.assertEqual(roi["effective_mode"], "trapezoid")
+        self.assertEqual(roi["fallback_reason"], "no_previous_frame")
+        self.assertEqual(roi["polygon"], [[20, 25], [120, 25], [199, 99], [0, 99]])
+
     def test_auto_backend_prefers_tensorrt_before_onnx_or_fallback(self) -> None:
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
         expected = segmentation.FrontendResult(

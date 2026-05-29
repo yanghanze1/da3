@@ -166,6 +166,15 @@ def polygon_to_mask(frame_shape: tuple[int, int] | tuple[int, int, int], polygon
     return mask.astype(bool)
 
 
+def _polygon_bbox(polygon_xy: list[list[int]]) -> list[int]:
+    points = np.asarray(polygon_xy, dtype=int).reshape((-1, 2))
+    x0 = int(np.min(points[:, 0]))
+    y0 = int(np.min(points[:, 1]))
+    x1 = int(np.max(points[:, 0]))
+    y1 = int(np.max(points[:, 1]))
+    return [x0, y0, max(1, x1 - x0 + 1), max(1, y1 - y0 + 1)]
+
+
 def _resolve_processing_bbox(
     frame_shape: tuple[int, int] | tuple[int, int, int],
     rect_cfg: dict[str, Any],
@@ -192,46 +201,97 @@ def _resolve_processing_bbox(
     return clipped, source
 
 
-def resolve_processing_roi(frame_shape: tuple[int, int] | tuple[int, int, int], config: dict[str, Any]) -> dict[str, Any] | None:
+def _processing_obstacle_mask_source(rect_cfg: dict[str, Any], mode: str) -> str:
+    source = str(rect_cfg.get("obstacle_analysis_mask", "legacy_analysis_mask"))
+    if mode in {"trapezoid", "foe_road_triangle"} and "obstacle_analysis_mask" not in rect_cfg:
+        source = "processing_roi"
+    return source
+
+
+def _trapezoid_polygon(
+    frame_shape: tuple[int, int] | tuple[int, int, int],
+    rect_cfg: dict[str, Any],
+    clipped: list[int],
+) -> list[list[int]]:
+    h, w = int(frame_shape[0]), int(frame_shape[1])
+    x, y, bw, _ = clipped
+    top_right_x = min(w - 1, x + max(0, bw))
+    bottom_full_width = bool(rect_cfg.get("trapezoid_bottom_full_width", True))
+    if bottom_full_width:
+        bottom_left = [0, h - 1]
+        bottom_right = [w - 1, h - 1]
+    else:
+        _, _, _, bh = clipped
+        bottom_y = min(h - 1, y + max(0, bh))
+        bottom_left = [x, bottom_y]
+        bottom_right = [top_right_x, bottom_y]
+    return [[int(x), int(y)], [int(top_right_x), int(y)], bottom_right, bottom_left]
+
+
+def _dynamic_processing_roi(
+    frame_shape: tuple[int, int] | tuple[int, int, int],
+    rect_cfg: dict[str, Any],
+    dynamic_roi: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not dynamic_roi or dynamic_roi.get("status") != "ok" or not dynamic_roi.get("polygon"):
+        return None
+    mode = str(rect_cfg.get("mode", "manual")).lower()
+    polygon = [[int(round(float(px))), int(round(float(py)))] for px, py in dynamic_roi["polygon"]]
+    bbox = [int(value) for value in dynamic_roi.get("bbox") or _polygon_bbox(polygon)]
+    metadata = {key: value for key, value in dynamic_roi.items() if key not in {"state"}}
+    return {
+        "enabled": True,
+        "mode": mode,
+        "effective_mode": "foe_road_triangle",
+        "source": str(dynamic_roi.get("source", "foe_road_triangle")),
+        "bbox": bbox,
+        "polygon": polygon,
+        "restrict_analysis_mask": bool(rect_cfg.get("restrict_analysis_mask", True)),
+        "restrict_road_mask": bool(rect_cfg.get("restrict_road_mask", False)),
+        "draw_overlay": bool(rect_cfg.get("draw_overlay", True)),
+        "obstacle_analysis_mask": _processing_obstacle_mask_source(rect_cfg, mode),
+        "foe_road_triangle": metadata,
+    }
+
+
+def resolve_processing_roi(
+    frame_shape: tuple[int, int] | tuple[int, int, int],
+    config: dict[str, Any],
+    dynamic_roi: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     rect_cfg = config.get("processing_rect") or {}
     if not rect_cfg or not bool(rect_cfg.get("enabled", False)):
         return None
+
+    dynamic_processing_roi = _dynamic_processing_roi(frame_shape, rect_cfg, dynamic_roi)
+    if dynamic_processing_roi is not None:
+        return dynamic_processing_roi
 
     resolved_bbox = _resolve_processing_bbox(frame_shape, rect_cfg)
     if resolved_bbox is None:
         return None
     clipped, source = resolved_bbox
-    h, w = int(frame_shape[0]), int(frame_shape[1])
     mode = str(rect_cfg.get("mode", "manual")).lower()
-    obstacle_mask_source = str(rect_cfg.get("obstacle_analysis_mask", "legacy_analysis_mask"))
-    if mode == "trapezoid" and "obstacle_analysis_mask" not in rect_cfg:
-        obstacle_mask_source = "processing_roi"
+    effective_mode = str(rect_cfg.get("fallback_mode", "trapezoid" if mode == "foe_road_triangle" else mode)).lower()
 
     processing_roi: dict[str, Any] = {
         "enabled": True,
         "mode": mode,
+        "effective_mode": effective_mode,
         "source": source,
         "bbox": clipped,
         "restrict_analysis_mask": bool(rect_cfg.get("restrict_analysis_mask", True)),
         "restrict_road_mask": bool(rect_cfg.get("restrict_road_mask", False)),
         "draw_overlay": bool(rect_cfg.get("draw_overlay", True)),
-        "obstacle_analysis_mask": obstacle_mask_source,
+        "obstacle_analysis_mask": _processing_obstacle_mask_source(rect_cfg, mode),
     }
 
-    if mode == "trapezoid":
-        x, y, bw, _ = clipped
-        top_right_x = min(w - 1, x + max(0, bw))
-        bottom_full_width = bool(rect_cfg.get("trapezoid_bottom_full_width", True))
-        if bottom_full_width:
-            bottom_left = [0, h - 1]
-            bottom_right = [w - 1, h - 1]
-        else:
-            _, _, _, bh = clipped
-            bottom_y = min(h - 1, y + max(0, bh))
-            bottom_left = [x, bottom_y]
-            bottom_right = [top_right_x, bottom_y]
-        polygon = [[x, y], [top_right_x, y], bottom_right, bottom_left]
-        processing_roi["polygon"] = [[int(px), int(py)] for px, py in polygon]
+    if effective_mode == "trapezoid":
+        processing_roi["polygon"] = _trapezoid_polygon(frame_shape, rect_cfg, clipped)
+    if mode == "foe_road_triangle":
+        processing_roi["fallback"] = True
+        processing_roi["fallback_reason"] = str((dynamic_roi or {}).get("reason", "dynamic_roi_not_provided"))
+        processing_roi["foe_road_triangle"] = {key: value for key, value in (dynamic_roi or {}).items() if key not in {"state"}}
 
     return processing_roi
 
@@ -240,8 +300,13 @@ def resolve_processing_rect(frame_shape: tuple[int, int] | tuple[int, int, int],
     return resolve_processing_roi(frame_shape, config)
 
 
-def _apply_processing_rect(result: FrontendResult, frame_shape: tuple[int, int, int], config: dict[str, Any]) -> FrontendResult:
-    processing_roi = resolve_processing_roi(frame_shape, config)
+def apply_processing_rect(
+    result: FrontendResult,
+    frame_shape: tuple[int, int, int],
+    config: dict[str, Any],
+    dynamic_roi: dict[str, Any] | None = None,
+) -> FrontendResult:
+    processing_roi = resolve_processing_roi(frame_shape, config, dynamic_roi=dynamic_roi)
     if processing_roi is None:
         return result
 
@@ -503,7 +568,12 @@ def _augment_with_fallback_rois(result: FrontendResult, frame: np.ndarray, confi
     return result
 
 
-def segment_frame(frame: np.ndarray, config: dict[str, Any]) -> FrontendResult:
+def segment_frame(
+    frame: np.ndarray,
+    config: dict[str, Any],
+    dynamic_processing_roi: dict[str, Any] | None = None,
+    apply_processing_roi: bool = True,
+) -> FrontendResult:
     backend = _normalize_backend_name(str(config.get("backend", "auto")))
     attempts: list[dict[str, Any]] = []
     last_error: Exception | None = None
@@ -532,7 +602,9 @@ def segment_frame(frame: np.ndarray, config: dict[str, Any]) -> FrontendResult:
         if result.backend == "fallback" and bool(config.get("fail_on_fallback", False)):
             raise RuntimeError("ROI backend fell back to fallback while fail_on_fallback is enabled.")
         result = _augment_with_fallback_rois(result, frame, config)
-        return _apply_processing_rect(result, frame.shape, config)
+        if not apply_processing_roi:
+            return result
+        return apply_processing_rect(result, frame.shape, config, dynamic_roi=dynamic_processing_roi)
 
     if backend == "auto":
         raise RuntimeError(f"No ROI backend could be initialized: {attempts}")

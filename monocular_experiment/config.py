@@ -9,15 +9,42 @@ from typing import Any
 import yaml
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_config_payload(config_path: Path, seen: set[Path]) -> dict[str, Any]:
+    resolved = config_path.resolve()
+    if resolved in seen:
+        raise ValueError(f"Circular config _base reference: {resolved}")
+    seen.add(resolved)
+    with resolved.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    base_paths = payload.pop("_base", payload.pop("base_config", []))
+    if isinstance(base_paths, (str, Path)):
+        base_paths = [base_paths]
+    merged: dict[str, Any] = {}
+    for base_path in base_paths or []:
+        base = Path(base_path)
+        if not base.is_absolute():
+            base = resolved.parent / base
+        merged = _deep_merge(merged, _load_config_payload(base, seen))
+    seen.remove(resolved)
+    return _deep_merge(merged, payload)
+
+
 def load_config(config_path: str | Path) -> dict[str, Any]:
     """讀取 YAML 設定檔，並補上設定檔本身所在位置資訊。"""
 
     # 先把輸入路徑轉成絕對路徑，避免後續相對路徑解析混亂。
     resolved = Path(config_path).resolve()
-    # 以 UTF-8 開啟設定檔。
-    with resolved.open("r", encoding="utf-8") as handle:
-        # 解析 YAML；若檔案為空則回傳空字典。
-        payload = yaml.safe_load(handle) or {}
+    payload = _load_config_payload(resolved, set())
     # 記錄設定檔完整路徑，供其他模組後續查用。
     payload["_config_path"] = str(resolved)
     # 記錄設定檔所在資料夾，供相對路徑展開時使用。

@@ -4,12 +4,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from tqdm import tqdm
 
 from .config import resolve_path
 from .control import ControlEvent, LogControlBackend, NoopControlBackend
 from .depth_model import infer_relative_depth
+from .foe_roi import build_foe_road_triangle_roi
 from .geometry import (
     bbox_iou,
     estimate_scale_factor_from_relative_depth_plane,
@@ -19,18 +21,28 @@ from .geometry import (
 )
 from .ground_plane import estimate_ground_plane
 from .io_utils import ensure_dir, list_frame_paths, load_yaml, read_image, read_motion_csv, save_json, write_jsonl
-from .models import FrameState, ScaleAlignmentResult
+from .models import FrameState, RoiCandidate, ScaleAlignmentResult
 from .obstacles import (
     build_candidate_observations,
+    build_depth_contrast_region_roi_candidates,
+    build_depth_delta_region_roi_candidates,
+    build_depth_gradient_contour_roi_candidates,
+    build_depth_residual_region_roi_candidates,
     build_depth_residual_roi_candidates,
     classify_all_candidates,
     summarize_cross_frame_matches,
 )
 from .risk import assess_tracked_objects, attach_risk_to_objects
-from .segmentation import segment_frame
+from .segmentation import apply_processing_rect, segment_frame
 from .temporal_measurement import TemporalMeasurementManager
 from .tracking import ObjectTracker
-from .visualization import save_overlay
+from .visualization import (
+    plot_calibration_basis,
+    plot_motion_profile,
+    plot_sequence_workflow_figures,
+    save_overlay,
+    save_workflow_frame_figures,
+)
 
 
 def _backend_for_run(output_dir: Path, backend_name: str):
@@ -149,6 +161,66 @@ def _bbox_area_px(bbox: list[int]) -> int:
     return int(max(0, int(bbox[2]) * int(bbox[3])))
 
 
+def _clip_bbox_to_mask_bbox(bbox: list[int], mask: np.ndarray) -> list[int] | None:
+    ys, xs = np.nonzero(np.asarray(mask, dtype=bool))
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    mx0, mx1 = int(xs.min()), int(xs.max()) + 1
+    my0, my1 = int(ys.min()), int(ys.max()) + 1
+    x, y, w, h = [int(value) for value in bbox]
+    x0 = max(x, mx0)
+    y0 = max(y, my0)
+    x1 = min(x + max(0, w), mx1)
+    y1 = min(y + max(0, h), my1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+
+
+def _bbox_mask_overlap_ratio(bbox: list[int], mask: np.ndarray) -> float:
+    x, y, w, h = [int(value) for value in bbox]
+    if w <= 0 or h <= 0:
+        return 0.0
+    h_img, w_img = mask.shape[:2]
+    x0 = max(0, min(w_img, x))
+    y0 = max(0, min(h_img, y))
+    x1 = max(x0, min(w_img, x + w))
+    y1 = max(y0, min(h_img, y + h))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float(np.count_nonzero(np.asarray(mask[y0:y1, x0:x1], dtype=bool)) / max(1, (x1 - x0) * (y1 - y0)))
+
+
+def _filter_rois_to_processing_mask(candidates: list[Any], processing_mask: np.ndarray | None, min_overlap_ratio: float = 0.01) -> list[Any]:
+    if processing_mask is None:
+        return candidates
+    filtered: list[Any] = []
+    for candidate in candidates:
+        if _bbox_mask_overlap_ratio(candidate.bbox, processing_mask) >= min_overlap_ratio:
+            filtered.append(candidate)
+    return filtered
+
+
+def _filter_candidates_to_processing_mask(candidates: list[Any], processing_mask: np.ndarray | None, min_overlap_ratio: float = 0.25) -> list[Any]:
+    if processing_mask is None:
+        return candidates
+    filtered: list[Any] = []
+    for candidate in candidates:
+        if _bbox_mask_overlap_ratio(candidate.bbox, processing_mask) < min_overlap_ratio:
+            continue
+        clipped = _clip_bbox_to_mask_bbox(candidate.bbox, processing_mask)
+        if clipped is None:
+            continue
+        candidate.bbox = clipped
+        if hasattr(candidate, "metadata"):
+            candidate.metadata = dict(candidate.metadata or {})
+            candidate.metadata["bbox"] = list(clipped)
+            candidate.metadata["final_bbox"] = list(clipped)
+            candidate.metadata["processing_roi_clipped"] = True
+        filtered.append(candidate)
+    return filtered
+
+
 def _bbox_intersection_area_px(a: list[int], b: list[int]) -> int:
     ax, ay, aw, ah = [int(value) for value in a]
     bx, by, bw, bh = [int(value) for value in b]
@@ -169,6 +241,7 @@ def _intersection_over_smaller_area(a: list[int], b: list[int]) -> float:
 def _roi_source_priority(candidate: Any, depth_roi_cfg: dict[str, Any]) -> int:
     source = str(getattr(candidate, "source", ""))
     priority = depth_roi_cfg.get("source_priority") or [
+        "depth_gradient_contour",
         "depth_residual_contour",
         "hybrid",
         "negative_space",
@@ -186,8 +259,10 @@ def _roi_sort_key(candidate: Any, depth_roi_cfg: dict[str, Any]) -> tuple[Any, .
     metadata = getattr(candidate, "metadata", {}) or {}
     point_count = int(metadata.get("point_count", metadata.get("support_count", 0)) or 0)
     mask_fill_ratio = float(metadata.get("mask_fill_ratio", 0.0) or 0.0)
+    selection_score = float(metadata.get("selection_score", 0.0) or 0.0)
     return (
         _roi_source_priority(candidate, depth_roi_cfg),
+        -selection_score,
         -point_count,
         -mask_fill_ratio,
         bool(getattr(candidate, "touch_border", False)),
@@ -262,10 +337,20 @@ def _select_roi_candidates_for_obstacles(
     frontend_backend: str | None = None,
 ) -> list[Any]:
     depth_roi_cfg = candidate_cfg.get("depth_contour_roi") or {}
-    if not bool(depth_roi_cfg.get("enabled", False)):
+    gradient_roi_cfg = candidate_cfg.get("depth_gradient_contour_roi") or {}
+    region_roi_cfg = candidate_cfg.get("depth_residual_region_roi") or {}
+    contrast_roi_cfg = candidate_cfg.get("depth_contrast_region_roi") or {}
+    delta_roi_cfg = candidate_cfg.get("depth_delta_region_roi") or {}
+    if (
+        not bool(depth_roi_cfg.get("enabled", False))
+        and not bool(gradient_roi_cfg.get("enabled", False))
+        and not bool(region_roi_cfg.get("enabled", False))
+        and not bool(contrast_roi_cfg.get("enabled", False))
+        and not bool(delta_roi_cfg.get("enabled", False))
+    ):
         return frontend_rois
 
-    threshold = float(depth_roi_cfg.get("deduplicate_iou_threshold", 0.7))
+    threshold = float(depth_roi_cfg.get("deduplicate_iou_threshold", gradient_roi_cfg.get("deduplicate_iou_threshold", 0.7)))
     filtered_depth = _filter_roi_candidates(depth_roi_candidates, depth_roi_cfg, frame_shape)
     filtered_frontend = _filter_roi_candidates(frontend_rois, depth_roi_cfg, frame_shape)
     selection_mode = str(depth_roi_cfg.get("selection_mode", "depth_first")).lower()
@@ -297,6 +382,32 @@ def _select_roi_candidates_for_obstacles(
     return []
 
 
+def _processing_roi_candidate(frontend: Any, frame_shape: tuple[int, int, int], candidate_cfg: dict[str, Any]) -> RoiCandidate | None:
+    if str(candidate_cfg.get("fallback_roi_source", "")).lower() != "processing_roi":
+        return None
+    processing_roi = getattr(frontend, "processing_roi", None) or {}
+    bbox = processing_roi.get("bbox")
+    if not bbox:
+        return None
+    frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
+    x, y, w, h = [int(value) for value in list(bbox)[:4]]
+    x0 = max(0, min(frame_w, x))
+    y0 = max(0, min(frame_h, y))
+    x1 = max(x0, min(frame_w, x + max(0, w)))
+    y1 = max(y0, min(frame_h, y + max(0, h)))
+    clipped = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+    if clipped[2] <= 0 or clipped[3] <= 0:
+        return None
+    return RoiCandidate(
+        roi_id="processing_roi_000",
+        bbox=clipped,
+        area_px=int(clipped[2] * clipped[3]),
+        touch_border=bool(x0 <= 0 or y0 <= 0 or x1 >= frame_w or y1 >= frame_h),
+        source="processing_roi",
+        metadata={"effective_mode": processing_roi.get("effective_mode"), "raw_bbox": list(bbox)},
+    )
+
+
 def _export_roi_diagnostics(candidates: list[Any]) -> list[dict[str, Any]]:
     exported: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -310,12 +421,183 @@ def _export_roi_diagnostics(candidates: list[Any]) -> list[dict[str, Any]]:
                 "touch_border": bool(getattr(candidate, "touch_border", False)),
                 "metadata": {
                     key: metadata.get(key)
-                    for key in ["sign", "raw_bbox", "point_count", "mask_fill_ratio", "border_touch"]
+                    for key in [
+                        "sources",
+                        "sign",
+                        "raw_bbox",
+                        "point_count",
+                        "component_area_px",
+                        "mask_fill_ratio",
+                        "depth_source_used",
+                        "depth_gradient_score",
+                        "color_edge_score",
+                        "depth_range",
+                        "delta_mean",
+                        "delta_min",
+                        "delta_max",
+                        "ring_delta",
+                        "selection_score",
+                        "center_y_ratio",
+                        "bottom_ratio",
+                        "aspect_h_over_w",
+                        "road_prior_overlap_ratio",
+                        "road_prior_bottom_contact",
+                        "border_touch",
+                    ]
                     if key in metadata
                 },
             }
         )
     return exported
+
+
+def _workflow_object_bbox(obj: dict[str, Any]) -> list[int] | None:
+    metadata = obj.get("metadata") or {}
+    bbox = metadata.get("final_bbox") or metadata.get("bbox") or metadata.get("roi_bbox") or obj.get("bbox")
+    if not bbox or len(bbox) < 4:
+        return None
+    x, y, w, h = [int(round(float(value))) for value in list(bbox)[:4]]
+    if w <= 0 or h <= 0:
+        return None
+    return [x, y, w, h]
+
+
+def _bbox_gray_score(frame_bgr: np.ndarray, bbox: list[int]) -> float:
+    x, y, w, h = [int(value) for value in bbox]
+    frame_h, frame_w = frame_bgr.shape[:2]
+    x0 = max(0, min(frame_w, x))
+    y0 = max(0, min(frame_h, y))
+    x1 = max(x0, min(frame_w, x + w))
+    y1 = max(y0, min(frame_h, y + h))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    hsv = np.asarray(cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV), dtype=np.float32)
+    saturation = float(np.median(hsv[:, :, 1])) if hsv.size else 255.0
+    return float(max(0.0, min(1.0, 1.0 - saturation / 80.0)))
+
+
+def _score_workflow_figure_candidate(
+    *,
+    frame_bgr: np.ndarray,
+    frame_index: int,
+    frame_count: int,
+    tracked_objects: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    final_window = max(1, int(config.get("workflow_figure_final_window", 5) or 5))
+    window_start = max(0, frame_count - final_window)
+    if frame_index < window_start:
+        return None
+
+    min_area = int(config.get("workflow_figure_min_box_area_px", 600) or 0)
+    min_quality = float(config.get("workflow_figure_min_temporal_quality", 0.60) or 0.0)
+    require_applied = bool(config.get("workflow_figure_require_temporal_applied", True))
+    prefer_gray = bool(config.get("workflow_figure_prefer_gray_object", True))
+    recency_score = (frame_index - window_start) / max(1, frame_count - 1 - window_start)
+    best: dict[str, Any] | None = None
+
+    for obj in tracked_objects:
+        if str(obj.get("state", "")) in {"predicted", "retired"}:
+            continue
+        bbox = _workflow_object_bbox(obj)
+        if bbox is None:
+            continue
+        area = _bbox_area_px(bbox)
+        if area < min_area:
+            continue
+        temporal = (obj.get("metadata") or {}).get("temporal_measurement") or {}
+        quality = float(temporal.get("quality", 0.0) or 0.0)
+        if str(temporal.get("status", "")) != "ok":
+            continue
+        if require_applied and not bool(temporal.get("applied")):
+            continue
+        if quality < min_quality:
+            continue
+        if not temporal.get("selected_keyframes"):
+            continue
+
+        gray_score = _bbox_gray_score(frame_bgr, bbox) if prefer_gray else 0.0
+        area_score = min(1.0, area / 3500.0)
+        score = 1000.0 + 100.0 * quality + 40.0 * area_score + 15.0 * gray_score + 5.0 * recency_score
+        candidate = {
+            "status": "selected",
+            "mode": str(config.get("workflow_figure_selection_mode", "auto_temporal_boxed")),
+            "frame_index": int(frame_index),
+            "object_id": str(obj.get("object_id", "")),
+            "candidate_id": str(obj.get("candidate_id", "")),
+            "bbox": bbox,
+            "score": float(score),
+            "gray_score": float(gray_score),
+            "box_area_px": int(area),
+            "temporal_status": str(temporal.get("status", "")),
+            "temporal_applied": bool(temporal.get("applied")),
+            "temporal_quality": quality,
+            "temporal_method": str(temporal.get("method", "")),
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def _workflow_figure_bundle(
+    *,
+    frame_bgr: np.ndarray,
+    frame_id: str,
+    frame_path: str | Path,
+    frontend: Any,
+    relative_depth: np.ndarray,
+    absolute_depth: np.ndarray,
+    scale_result: Any,
+    road_sample: dict[str, Any],
+    plane: Any,
+    obstacle_analysis_mask: np.ndarray,
+    candidate_sample: dict[str, Any],
+    depth_roi_candidates: list[Any],
+    selected_rois: list[Any],
+    candidate_clusters: list[Any],
+    tracked_objects: list[dict[str, Any]],
+    risk_assessments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "frame_bgr": frame_bgr.copy(),
+        "frame_id": frame_id,
+        "frame_path": Path(frame_path),
+        "frontend": frontend,
+        "relative_depth": relative_depth.copy(),
+        "absolute_depth": absolute_depth.copy(),
+        "scale_result": scale_result,
+        "road_sample": road_sample,
+        "plane": plane,
+        "obstacle_analysis_mask": obstacle_analysis_mask.copy(),
+        "candidate_sample": candidate_sample,
+        "depth_roi_candidates": list(depth_roi_candidates),
+        "selected_rois": list(selected_rois),
+        "candidate_clusters": list(candidate_clusters),
+        "tracked_objects": list(tracked_objects),
+        "risk_assessments": list(risk_assessments),
+    }
+
+
+def _save_workflow_figure_bundle(bundle: dict[str, Any], figures_dir: Path) -> None:
+    save_workflow_frame_figures(
+        frame_bgr=bundle["frame_bgr"],
+        frame_id=bundle["frame_id"],
+        frame_path=bundle["frame_path"],
+        frontend=bundle["frontend"],
+        relative_depth=bundle["relative_depth"],
+        absolute_depth=bundle["absolute_depth"],
+        scale_result=bundle["scale_result"],
+        road_sample=bundle["road_sample"],
+        plane=bundle["plane"],
+        obstacle_analysis_mask=bundle["obstacle_analysis_mask"],
+        candidate_sample=bundle["candidate_sample"],
+        depth_roi_candidates=bundle["depth_roi_candidates"],
+        selected_rois=bundle["selected_rois"],
+        candidate_clusters=bundle["candidate_clusters"],
+        tracked_objects=bundle["tracked_objects"],
+        risk_assessments=bundle["risk_assessments"],
+        output_dir=figures_dir,
+    )
 
 
 def _export_obstacle_rois(
@@ -378,6 +660,21 @@ def run_pipeline(
 
     output_dir = ensure_dir(output_dir)
     overlays_dir = ensure_dir(output_dir / "overlays")
+    visualization_cfg = dict(config.get("visualization", {}))
+    save_step_figures = bool(visualization_cfg.get("save_step_figures", True))
+    figures_dir = ensure_dir(output_dir / str(visualization_cfg.get("step_figures_dir", "figures"))) if save_step_figures else output_dir / "figures"
+    workflow_figure_frame_index = int(visualization_cfg.get("workflow_figure_frame_index", 0) or 0)
+    if workflow_figure_frame_index < 0:
+        workflow_figure_frame_index = max(0, len(frame_paths) + workflow_figure_frame_index)
+    workflow_figure_selection_mode = str(visualization_cfg.get("workflow_figure_selection_mode", "fixed_index")).lower()
+    workflow_figure_auto_select = workflow_figure_selection_mode == "auto_temporal_boxed"
+    workflow_figure_best_bundle: dict[str, Any] | None = None
+    workflow_figure_best_selection: dict[str, Any] | None = None
+    workflow_figure_fallback_bundle: dict[str, Any] | None = None
+    workflow_figure_selection_summary: dict[str, Any] = {
+        "status": "disabled" if not save_step_figures else "pending",
+        "mode": workflow_figure_selection_mode,
+    }
     backend = _backend_for_run(Path(output_dir), control_backend)
     tracker = ObjectTracker(config["tracking"])
     temporal_cfg = dict(config.get("temporal_measurement", {}))
@@ -388,6 +685,10 @@ def run_pipeline(
 
     results: list[dict[str, Any]] = []
     frame_latency_ms: list[float] = []
+    workflow_motion_rows: list[dict[str, Any]] = []
+    workflow_sequence_rows: list[dict[str, Any]] = []
+    workflow_raw_risk_rows: list[dict[str, Any]] = []
+    workflow_risk_event_rows: list[dict[str, Any]] = []
     risk_event_count = 0
     risk_emitter = _RiskEventEmitter(config["risk"])
 
@@ -401,6 +702,8 @@ def run_pipeline(
     risk_cfg = config["risk"]
 
     prev_candidates = []
+    prev_frame: np.ndarray | None = None
+    foe_roi_state: dict[str, Any] = {}
 
     for index, frame_path in enumerate(tqdm(frame_paths, desc=f"run-pipeline:{sequence_id}")):
         frame_id = frame_path.stem
@@ -435,11 +738,32 @@ def run_pipeline(
             cumulative_forward_m = float(motion_curr["cumulative_distance_m"])
         else:
             cumulative_forward_m += max(0.0, float(forward_displacement_m))
+        workflow_motion_rows.append(
+            {
+                "frame_id": frame_id,
+                "speed_mps": float(speed_mps),
+                "forward_displacement_m": float(forward_displacement_m),
+                "cumulative_forward_m": float(cumulative_forward_m),
+            }
+        )
 
         start_total = time.perf_counter()
 
         start = time.perf_counter()
-        frontend = segment_frame(frame, roi_cfg)
+        processing_rect_cfg = roi_cfg.get("processing_rect") or {}
+        use_foe_processing_roi = str(processing_rect_cfg.get("mode", "")).lower() == "foe_road_triangle"
+        frontend = segment_frame(frame, roi_cfg, apply_processing_roi=not use_foe_processing_roi)
+        if use_foe_processing_roi:
+            foe_cfg = dict(processing_rect_cfg.get("foe_road_triangle") or {})
+            dynamic_processing_roi = build_foe_road_triangle_roi(
+                previous_frame_bgr=prev_frame,
+                current_frame_bgr=frame,
+                road_mask=frontend.road_mask,
+                config=foe_cfg,
+                previous_state=foe_roi_state,
+            )
+            foe_roi_state = dict(dynamic_processing_roi.get("state") or foe_roi_state)
+            frontend = apply_processing_rect(frontend, frame.shape, roi_cfg, dynamic_roi=dynamic_processing_roi)
         frontend_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
@@ -496,6 +820,7 @@ def run_pipeline(
 
         start = time.perf_counter()
         obstacle_analysis_mask, obstacle_analysis_mask_source = _resolve_obstacle_analysis_mask(frontend)
+        processing_filter_mask = obstacle_analysis_mask if obstacle_analysis_mask_source == "processing_roi" else None
         candidate_sample = sample_points_from_mask(
             depth_map_m=absolute_depth,
             intrinsics=intrinsics,
@@ -514,13 +839,63 @@ def run_pipeline(
             analysis_mask=obstacle_analysis_mask,
             config=candidate_cfg,
         )
+        depth_roi_candidates.extend(
+            build_depth_residual_region_roi_candidates(
+                candidate_image_points=candidate_sample["image_points"],
+                candidate_depths_m=candidate_sample["depths_m"],
+                plane=plane,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                frame_shape=frame.shape,
+                analysis_mask=obstacle_analysis_mask,
+                config=candidate_cfg,
+            )
+        )
+        depth_roi_candidates.extend(
+            build_depth_contrast_region_roi_candidates(
+                absolute_depth_map=absolute_depth,
+                relative_depth_map=relative_depth,
+                analysis_mask=obstacle_analysis_mask,
+                config=candidate_cfg,
+            )
+        )
+        depth_roi_candidates.extend(
+            build_depth_delta_region_roi_candidates(
+                absolute_depth_map=absolute_depth,
+                relative_depth_map=relative_depth,
+                analysis_mask=obstacle_analysis_mask,
+                config=candidate_cfg,
+            )
+        )
+        depth_roi_candidates.extend(
+            build_depth_gradient_contour_roi_candidates(
+                image=frame,
+                absolute_depth_map=absolute_depth,
+                relative_depth_map=relative_depth,
+                analysis_mask=obstacle_analysis_mask,
+                road_mask=frontend.road_mask,
+                config=candidate_cfg,
+            )
+        )
+        frontend_rois_for_candidates = (
+            frontend.roi_candidates if bool(candidate_cfg.get("use_frontend_rois_for_obstacles", True)) else []
+        )
         roi_candidates_for_candidates = _select_roi_candidates_for_obstacles(
-            frontend.roi_candidates,
+            frontend_rois_for_candidates,
             depth_roi_candidates,
             candidate_cfg,
             frame_shape=frame.shape,
             frontend_backend=frontend.backend,
         )
+        roi_candidates_for_candidates = _filter_rois_to_processing_mask(
+            roi_candidates_for_candidates,
+            processing_filter_mask,
+            min_overlap_ratio=float(candidate_cfg.get("processing_roi_min_roi_overlap", 0.01)),
+        )
+        if not roi_candidates_for_candidates:
+            processing_candidate = _processing_roi_candidate(frontend, frame.shape, candidate_cfg)
+            if processing_candidate is not None:
+                roi_candidates_for_candidates = [processing_candidate]
         candidate_clusters = build_candidate_observations(
             roi_candidates=roi_candidates_for_candidates,
             candidate_image_points=candidate_sample["image_points"],
@@ -536,6 +911,11 @@ def run_pipeline(
             candidates=candidate_clusters,
             road_mask=frontend.road_mask,
             config=candidate_cfg,
+        )
+        candidate_clusters = _filter_candidates_to_processing_mask(
+            candidate_clusters,
+            processing_filter_mask,
+            min_overlap_ratio=float(candidate_cfg.get("processing_roi_min_candidate_overlap", 0.25)),
         )
         temporal_measurements: list[dict[str, Any]] = []
         temporal_ms = 0.0
@@ -637,6 +1017,44 @@ def run_pipeline(
             1 for item in temporal_measurements if item.get("applied")
         )
 
+        tracked_state_counts: dict[str, int] = {}
+        for obj in tracked_objects:
+            tracked_state_counts[obj.state] = tracked_state_counts.get(obj.state, 0) + 1
+        risk_event_decision_counts: dict[str, int] = {}
+        for event in risk_events:
+            decision = str(event.get("decision", "safe"))
+            risk_event_decision_counts[decision] = risk_event_decision_counts.get(decision, 0) + 1
+            workflow_risk_event_rows.append({"frame_id": frame_id, **event})
+        for event in raw_risk_events:
+            metadata = dict(event.get("metadata") or {})
+            workflow_raw_risk_rows.append(
+                {
+                    "frame_id": frame_id,
+                    "object_id": event.get("object_id", ""),
+                    "risk_weight": event.get("risk_weight", "omega0"),
+                    "decision": event.get("decision", "safe"),
+                    "distance_m": float(metadata.get("distance_m", 0.0) or 0.0),
+                    "height_m": float(metadata.get("height_m", 0.0) or 0.0),
+                    "width_m": float(metadata.get("width_m", 0.0) or 0.0),
+                    "w_clear_m": float(event.get("w_clear_m", 0.0) or 0.0),
+                    "d_brake_m": float(event.get("d_brake_m", 0.0) or 0.0),
+                    "lateral_occupancy_ratio": float(metadata.get("lateral_occupancy_ratio", 0.0) or 0.0),
+                }
+            )
+        workflow_sequence_rows.append(
+            {
+                "frame_id": frame_id,
+                "cross_frame_match_count": len(cross_frame_matches),
+                "tracked_state_counts": tracked_state_counts,
+                "temporal_keyframe_count": temporal_manager.keyframe_count(),
+                "temporal_attempted_count": len(temporal_measurements),
+                "temporal_ok_count": road_mask_stats["temporal_measurement_ok_count"],
+                "temporal_applied_count": road_mask_stats["temporal_measurement_applied_count"],
+                "risk_event_decision_counts": risk_event_decision_counts,
+                "timing_ms": timing_ms,
+            }
+        )
+
         frame_state = FrameState(
             frame_id=frame_id,
             depth_stats=_depth_stats(relative_depth, confidence, str(depth_output["backend"])),
@@ -654,14 +1072,53 @@ def run_pipeline(
         )
         results.append(frame_state.to_dict())
 
-        if config.get("visualization", {}).get("save_overlays", True):
+        tracked_objects_dict = [item.to_dict() for item in tracked_objects]
+        if save_step_figures:
+            bundle = _workflow_figure_bundle(
+                frame_bgr=frame,
+                frame_id=frame_id,
+                frame_path=frame_path,
+                frontend=frontend,
+                relative_depth=relative_depth,
+                absolute_depth=absolute_depth,
+                scale_result=scale_result,
+                road_sample=road_sample,
+                plane=plane,
+                obstacle_analysis_mask=obstacle_analysis_mask,
+                candidate_sample=candidate_sample,
+                depth_roi_candidates=depth_roi_candidates,
+                selected_rois=roi_candidates_for_candidates,
+                candidate_clusters=candidate_clusters,
+                tracked_objects=tracked_objects_dict,
+                risk_assessments=raw_risk_events,
+            )
+            if index == workflow_figure_frame_index:
+                workflow_figure_fallback_bundle = bundle
+            if workflow_figure_auto_select:
+                selection = _score_workflow_figure_candidate(
+                    frame_bgr=frame,
+                    frame_index=index,
+                    frame_count=len(frame_paths),
+                    tracked_objects=tracked_objects_dict,
+                    config=visualization_cfg,
+                )
+                if selection is not None and (
+                    workflow_figure_best_selection is None or selection["score"] > workflow_figure_best_selection["score"]
+                ):
+                    selection = {**selection, "frame_id": frame_id}
+                    workflow_figure_best_selection = selection
+                    workflow_figure_best_bundle = bundle
+            elif index == workflow_figure_frame_index:
+                workflow_figure_selection_summary = {"status": "selected", "mode": workflow_figure_selection_mode, "frame_id": frame_id, "frame_index": int(index)}
+                workflow_figure_best_bundle = bundle
+        if visualization_cfg.get("save_overlays", True):
             save_overlay(
                 frame_bgr=frame,
                 frame_id=frame_id,
                 frontend=frontend,
                 road_points=road_sample["image_points"],
                 plane=plane.to_dict(),
-                tracked_objects=[item.to_dict() for item in tracked_objects],
+                tracked_objects=tracked_objects_dict,
                 output_path=overlays_dir / f"{frame_id}.png",
                 candidate_rois=roi_candidates_for_candidates,
             )
@@ -675,14 +1132,42 @@ def run_pipeline(
             candidates=candidate_clusters,
         )
         prev_candidates = candidate_clusters
+        prev_frame = frame
 
     write_jsonl(output_dir / "frame_states.jsonl", results)
+    if save_step_figures:
+        selected_bundle = workflow_figure_best_bundle or workflow_figure_fallback_bundle
+        if workflow_figure_auto_select and workflow_figure_best_selection is not None:
+            workflow_figure_selection_summary = dict(workflow_figure_best_selection)
+        elif selected_bundle is workflow_figure_fallback_bundle and workflow_figure_fallback_bundle is not None:
+            workflow_figure_selection_summary = {
+                "status": "fallback_selected",
+                "mode": workflow_figure_selection_mode,
+                "frame_id": str(workflow_figure_fallback_bundle.get("frame_id", "")),
+                "frame_index": int(workflow_figure_frame_index),
+            }
+        elif selected_bundle is None:
+            workflow_figure_selection_summary = {"status": "not_selected", "mode": workflow_figure_selection_mode}
+        if selected_bundle is not None:
+            _save_workflow_figure_bundle(selected_bundle, figures_dir)
+
     summary = {
         "sequence_id": sequence_id,
         "frames_processed": len(results),
         "mean_latency_ms": float(np.mean(frame_latency_ms)) if frame_latency_ms else 0.0,
         "max_latency_ms": float(np.max(frame_latency_ms)) if frame_latency_ms else 0.0,
         "risk_event_count": int(risk_event_count),
+        "workflow_figure_selection": workflow_figure_selection_summary,
     }
+    if save_step_figures:
+        plot_motion_profile(workflow_motion_rows, figures_dir / "fig02_motion_profile.png")
+        plot_calibration_basis(intrinsics, extrinsics, figures_dir / "fig03_calibration_basis.png")
+        plot_sequence_workflow_figures(
+            sequence_rows=workflow_sequence_rows,
+            raw_risk_rows=workflow_raw_risk_rows,
+            risk_event_rows=workflow_risk_event_rows,
+            summary=summary,
+            output_dir=figures_dir,
+        )
     save_json(output_dir / "pipeline_summary.json", summary)
     return summary

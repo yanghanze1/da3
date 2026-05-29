@@ -436,7 +436,8 @@ def _append_clustered_candidates(
         anchor[2] = distance_m
         cluster_bbox = _cluster_bbox(cluster_image)
         padded_cluster_bbox = _pad_bbox_within_bounds(cluster_bbox, roi.bbox, config)
-        use_roi_bbox = bool(config.get("use_roi_bbox_for_depth_roi", False)) and roi.source == "depth_residual_contour"
+        use_roi_bbox_sources = _configured_sources(config, "use_roi_bbox_sources") or {"depth_residual_contour"}
+        use_roi_bbox = bool(config.get("use_roi_bbox_for_depth_roi", False)) and roi.source in use_roi_bbox_sources
         bbox = list(roi.bbox) if use_roi_bbox else padded_cluster_bbox
         bbox_area = int(max(1, bbox[2] * bbox[3]))
         if cluster_record is not None:
@@ -647,6 +648,998 @@ def _depth_roi_components(
             )
         )
     return candidates
+
+
+def _fill_region_holes(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    flood = (~mask).astype(np.uint8) * 255
+    canvas = flood.copy()
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(canvas, flood_mask, seedPoint=(0, 0), newVal=128)
+    return mask | (canvas == 255)
+
+
+def _clean_depth_residual_region_mask(mask: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    cleaned = mask.astype(np.uint8)
+    dilate_kernel_px = int(config.get("dilate_kernel_px", 9))
+    if dilate_kernel_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel_px, dilate_kernel_px))
+        cleaned = cv2.dilate(cleaned, kernel)
+    close_kernel_px = int(config.get("close_kernel_px", 21))
+    if close_kernel_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_px, close_kernel_px))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    cleaned_bool = cleaned.astype(bool)
+    if bool(config.get("fill_holes", True)):
+        cleaned_bool = _fill_region_holes(cleaned_bool)
+    open_kernel_px = int(config.get("open_kernel_px", 0))
+    if open_kernel_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel_px, open_kernel_px))
+        cleaned_bool = cv2.morphologyEx(cleaned_bool.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
+    return cleaned_bool
+
+
+def _depth_residual_region_components(
+    mask: np.ndarray,
+    residuals_by_pixel: np.ndarray,
+    depths_by_pixel: np.ndarray,
+    analysis_mask: np.ndarray,
+    sign: str,
+    threshold_m: float,
+    config: dict[str, Any],
+    start_id: int,
+) -> list[RoiCandidate]:
+    min_area_px = int(config.get("min_component_area_px", 800))
+    max_area_ratio = config.get("max_component_area_ratio")
+    min_bbox_width_px = int(config.get("min_bbox_width_px", 20))
+    min_bbox_height_px = int(config.get("min_bbox_height_px", 20))
+    min_mask_fill_ratio = float(config.get("min_mask_fill_ratio", 0.0))
+    min_sample_count = int(config.get("min_sample_count", 8))
+    min_abnormal_sample_ratio = float(config.get("min_residual_valid_ratio", config.get("min_abnormal_sample_ratio", 0.45)))
+    min_depth_contrast_m = float(config.get("min_depth_contrast_m", 0.08))
+    ring_dilate_px = int(config.get("contrast_ring_dilate_px", 21))
+    reject_boundary_touching = bool(config.get("reject_boundary_touching", False))
+    boundary_margin_px = int(config.get("boundary_margin_px", 1))
+
+    num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    h, w = mask.shape
+    frame_area = max(1, h * w)
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    candidates: list[RoiCandidate] = []
+
+    for label in range(1, num_labels):
+        component = label_img == label
+        area_px = int(stats[label, cv2.CC_STAT_AREA])
+        if area_px < min_area_px:
+            continue
+        if max_area_ratio is not None and area_px > float(max_area_ratio) * float(frame_area):
+            continue
+
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if bw < min_bbox_width_px or bh < min_bbox_height_px:
+            continue
+
+        border_touch = {
+            "top": bool(component[: max(1, boundary_margin_px), :].any()),
+            "bottom": bool(component[max(0, h - max(1, boundary_margin_px)) :, :].any()),
+            "left": bool(component[:, : max(1, boundary_margin_px)].any()),
+            "right": bool(component[:, max(0, w - max(1, boundary_margin_px)) :].any()),
+        }
+        touches_border = any(border_touch.values())
+        if reject_boundary_touching and touches_border:
+            continue
+
+        raw_bbox = [x, y, bw, bh]
+        mask_fill_ratio = float(area_px / max(1, bw * bh))
+        if mask_fill_ratio < min_mask_fill_ratio:
+            continue
+
+        component_residuals = residuals_by_pixel[component]
+        component_residuals = component_residuals[np.isfinite(component_residuals)]
+        if len(component_residuals) < min_sample_count:
+            continue
+        if sign == "positive":
+            abnormal_count = int(np.count_nonzero(component_residuals < -threshold_m))
+        else:
+            abnormal_count = int(np.count_nonzero(component_residuals > threshold_m))
+        abnormal_sample_ratio = float(abnormal_count / max(1, len(component_residuals)))
+        if abnormal_sample_ratio < min_abnormal_sample_ratio:
+            continue
+
+        component_depths = depths_by_pixel[component]
+        component_depths = component_depths[np.isfinite(component_depths)]
+        depth_contrast_m = 0.0
+        if min_depth_contrast_m > 0.0:
+            if ring_dilate_px > 1:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_dilate_px, ring_dilate_px))
+                ring = cv2.dilate(component.astype(np.uint8), kernel).astype(bool) & (~component) & analysis
+            else:
+                ring = (~component) & analysis
+            ring_depths = depths_by_pixel[ring]
+            ring_depths = ring_depths[np.isfinite(ring_depths)]
+            if len(component_depths) == 0 or len(ring_depths) == 0:
+                continue
+            depth_contrast_m = abs(float(np.median(component_depths)) - float(np.median(ring_depths)))
+            if depth_contrast_m < min_depth_contrast_m:
+                continue
+
+        expanded_bbox = _expand_bbox_xywh(raw_bbox, mask.shape, config)
+        candidates.append(
+            RoiCandidate(
+                roi_id=f"depth_region_roi_{start_id + len(candidates):03d}",
+                bbox=expanded_bbox,
+                area_px=area_px,
+                touch_border=touches_border,
+                source="depth_residual_region",
+                metadata={
+                    "sources": ["depth_residual_region"],
+                    "sign": sign,
+                    "raw_bbox": raw_bbox,
+                    "mask_fill_ratio": mask_fill_ratio,
+                    "point_count": int(len(component_residuals)),
+                    "component_area_px": area_px,
+                    "abnormal_sample_count": abnormal_count,
+                    "abnormal_sample_ratio": abnormal_sample_ratio,
+                    "depth_contrast_m": depth_contrast_m,
+                    "residual_mean_m": float(np.mean(component_residuals)) if len(component_residuals) else None,
+                    "residual_min_m": float(np.min(component_residuals)) if len(component_residuals) else None,
+                    "residual_max_m": float(np.max(component_residuals)) if len(component_residuals) else None,
+                    "depth_range": _finite_range(component_depths),
+                    "border_touch": border_touch,
+                },
+            )
+        )
+    return candidates
+
+
+def _limit_region_roi_candidates(candidates: list[RoiCandidate], config: dict[str, Any]) -> list[RoiCandidate]:
+    max_regions = int(config.get("max_selected_rois_per_frame", 0) or 0)
+    if max_regions <= 0 or len(candidates) <= max_regions:
+        return candidates
+
+    def score(candidate: RoiCandidate) -> tuple[float, int]:
+        metadata = candidate.metadata or {}
+        point_count = int(metadata.get("point_count", 0) or 0)
+        contrast = float(metadata.get("depth_contrast_m", 0.0) or 0.0)
+        abnormal_ratio = float(metadata.get("abnormal_sample_ratio", 0.0) or 0.0)
+        return (contrast * max(1, point_count) * max(0.01, abnormal_ratio), int(candidate.area_px))
+
+    return sorted(candidates, key=score, reverse=True)[:max_regions]
+
+
+def build_depth_residual_region_roi_candidates(
+    *,
+    candidate_image_points: np.ndarray,
+    candidate_depths_m: np.ndarray,
+    plane: PlaneEstimate,
+    intrinsics: dict[str, Any],
+    extrinsics: dict[str, Any],
+    frame_shape: tuple[int, int] | tuple[int, int, int],
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+) -> list[RoiCandidate]:
+    region_cfg = config.get("depth_residual_region_roi") or {}
+    if not bool(region_cfg.get("enabled", False)) or plane.status != "ok" or len(candidate_image_points) == 0:
+        return []
+
+    residuals, _ = _observed_minus_plane_depth_residual(
+        image_points=candidate_image_points,
+        observed_depths_m=candidate_depths_m,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+        plane=plane,
+    )
+    valid = np.isfinite(residuals)
+    positive_threshold = _resolve_depth_roi_threshold(region_cfg.get("positive_threshold_m"), float(config["h_pos_m"]))
+    negative_threshold = _resolve_depth_roi_threshold(region_cfg.get("negative_threshold_m"), float(config["h_neg_m"]))
+    positive_selector = valid & (residuals < -positive_threshold)
+    negative_selector = valid & (residuals > negative_threshold)
+
+    h, w = int(frame_shape[0]), int(frame_shape[1])
+    residuals_by_pixel = np.full((h, w), np.nan, dtype=np.float64)
+    depths_by_pixel = np.full((h, w), np.nan, dtype=np.float64)
+    points = np.rint(candidate_image_points[valid]).astype(int)
+    inside = (points[:, 0] >= 0) & (points[:, 0] < w) & (points[:, 1] >= 0) & (points[:, 1] < h)
+    if np.any(inside):
+        valid_residuals = residuals[valid]
+        valid_depths = candidate_depths_m[valid]
+        valid_points = points[inside]
+        residuals_by_pixel[valid_points[:, 1], valid_points[:, 0]] = valid_residuals[inside]
+        depths_by_pixel[valid_points[:, 1], valid_points[:, 0]] = valid_depths[inside]
+
+    analysis = analysis_mask.astype(bool)
+    positive_mask = _clean_depth_residual_region_mask(
+        _rasterize_points_mask(candidate_image_points, positive_selector, frame_shape) & analysis,
+        region_cfg,
+    ) & analysis
+    negative_mask = _clean_depth_residual_region_mask(
+        _rasterize_points_mask(candidate_image_points, negative_selector, frame_shape) & analysis,
+        region_cfg,
+    ) & analysis
+
+    candidates = _depth_residual_region_components(
+        positive_mask,
+        residuals_by_pixel,
+        depths_by_pixel,
+        analysis,
+        "positive",
+        positive_threshold,
+        region_cfg,
+        start_id=0,
+    )
+    candidates.extend(
+        _depth_residual_region_components(
+            negative_mask,
+            residuals_by_pixel,
+            depths_by_pixel,
+            analysis,
+            "negative",
+            negative_threshold,
+            region_cfg,
+            start_id=len(candidates),
+        )
+    )
+    return _limit_region_roi_candidates(candidates, region_cfg)
+
+
+def _depth_contrast_region_components(
+    mask: np.ndarray,
+    contrast_map: np.ndarray,
+    depth_map: np.ndarray,
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+) -> list[RoiCandidate]:
+    min_area_px = int(config.get("min_component_area_px", 1200))
+    max_area_ratio = config.get("max_component_area_ratio")
+    min_bbox_width_px = int(config.get("min_bbox_width_px", 30))
+    min_bbox_height_px = int(config.get("min_bbox_height_px", 30))
+    min_mask_fill_ratio = float(config.get("min_mask_fill_ratio", 0.03))
+    min_depth_contrast_m = float(config.get("min_depth_contrast_m", 0.08))
+    ring_dilate_px = int(config.get("contrast_ring_dilate_px", 25))
+    reject_boundary_touching = bool(config.get("reject_boundary_touching", False))
+    boundary_margin_px = int(config.get("boundary_margin_px", 1))
+
+    num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    h, w = mask.shape
+    frame_area = max(1, h * w)
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    candidates: list[RoiCandidate] = []
+
+    for label in range(1, num_labels):
+        component = label_img == label
+        area_px = int(stats[label, cv2.CC_STAT_AREA])
+        if area_px < min_area_px:
+            continue
+        if max_area_ratio is not None and area_px > float(max_area_ratio) * float(frame_area):
+            continue
+
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if bw < min_bbox_width_px or bh < min_bbox_height_px:
+            continue
+        mask_fill_ratio = float(area_px / max(1, bw * bh))
+        if mask_fill_ratio < min_mask_fill_ratio:
+            continue
+
+        border_touch = {
+            "top": bool(component[: max(1, boundary_margin_px), :].any()),
+            "bottom": bool(component[max(0, h - max(1, boundary_margin_px)) :, :].any()),
+            "left": bool(component[:, : max(1, boundary_margin_px)].any()),
+            "right": bool(component[:, max(0, w - max(1, boundary_margin_px)) :].any()),
+        }
+        touches_border = any(border_touch.values())
+        if reject_boundary_touching and touches_border:
+            continue
+
+        component_depths = depth_map[component]
+        component_depths = component_depths[np.isfinite(component_depths)]
+        if len(component_depths) == 0:
+            continue
+        if ring_dilate_px > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_dilate_px, ring_dilate_px))
+            ring = cv2.dilate(component.astype(np.uint8), kernel).astype(bool) & (~component) & analysis
+        else:
+            ring = (~component) & analysis
+        ring_depths = depth_map[ring]
+        ring_depths = ring_depths[np.isfinite(ring_depths)]
+        if len(ring_depths) == 0:
+            continue
+        signed_depth_delta_m = float(np.median(component_depths) - np.median(ring_depths))
+        depth_contrast_m = abs(signed_depth_delta_m)
+        if depth_contrast_m < min_depth_contrast_m:
+            continue
+
+        component_contrast = contrast_map[component]
+        component_contrast = component_contrast[np.isfinite(component_contrast)]
+        raw_bbox = [x, y, bw, bh]
+        expanded_bbox = _expand_bbox_xywh(raw_bbox, mask.shape, config)
+        candidates.append(
+            RoiCandidate(
+                roi_id=f"depth_contrast_roi_{len(candidates):03d}",
+                bbox=expanded_bbox,
+                area_px=area_px,
+                touch_border=touches_border,
+                source="depth_contrast_region",
+                metadata={
+                    "sources": ["depth_contrast_region"],
+                    "raw_bbox": raw_bbox,
+                    "mask_fill_ratio": mask_fill_ratio,
+                    "point_count": area_px,
+                    "component_area_px": area_px,
+                    "depth_contrast_m": depth_contrast_m,
+                    "signed_depth_delta_m": signed_depth_delta_m,
+                    "contrast_score_mean": float(np.mean(component_contrast)) if len(component_contrast) else 0.0,
+                    "contrast_score_max": float(np.max(component_contrast)) if len(component_contrast) else 0.0,
+                    "depth_range": _finite_range(component_depths),
+                    "border_touch": border_touch,
+                },
+            )
+        )
+    return candidates
+
+
+def _limit_contrast_roi_candidates(candidates: list[RoiCandidate], config: dict[str, Any]) -> list[RoiCandidate]:
+    max_regions = int(config.get("max_selected_rois_per_frame", 1) or 0)
+    if max_regions <= 0 or len(candidates) <= max_regions:
+        return candidates
+
+    def score(candidate: RoiCandidate) -> tuple[float, int]:
+        metadata = candidate.metadata or {}
+        contrast = float(metadata.get("depth_contrast_m", 0.0) or 0.0)
+        score_mean = float(metadata.get("contrast_score_mean", 0.0) or 0.0)
+        return (contrast * max(0.01, score_mean), int(candidate.area_px))
+
+    return sorted(candidates, key=score, reverse=True)[:max_regions]
+
+
+def _depth_delta_region_components(
+    mask: np.ndarray,
+    delta_map: np.ndarray,
+    normalized_depth: np.ndarray,
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+) -> list[RoiCandidate]:
+    min_area_px = int(config.get("min_component_area_px", 800))
+    max_area_ratio = config.get("max_component_area_ratio")
+    min_bbox_width_px = int(config.get("min_bbox_width_px", 25))
+    min_bbox_height_px = int(config.get("min_bbox_height_px", 40))
+    min_mask_fill_ratio = float(config.get("min_mask_fill_ratio", 0.08))
+    min_delta_mean_value = config.get("min_delta_mean")
+    if min_delta_mean_value is None:
+        min_delta_mean_value = config.get("delta_threshold")
+    if min_delta_mean_value is None:
+        min_delta_mean_value = 0.04
+    min_delta_mean = float(min_delta_mean_value)
+    max_bbox_width_ratio = config.get("max_bbox_width_ratio")
+    max_bbox_height_ratio = config.get("max_bbox_height_ratio")
+    min_aspect_ratio = config.get("min_bbox_aspect_ratio_h_over_w")
+    max_aspect_ratio = config.get("max_bbox_aspect_ratio_h_over_w")
+    reject_boundary_touching = bool(config.get("reject_boundary_touching", False))
+    boundary_margin_px = int(config.get("boundary_margin_px", 1))
+
+    num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    h, w = mask.shape
+    frame_area = max(1, h * w)
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    candidates: list[RoiCandidate] = []
+
+    for label in range(1, num_labels):
+        component = label_img == label
+        area_px = int(stats[label, cv2.CC_STAT_AREA])
+        if area_px < min_area_px:
+            continue
+        if max_area_ratio is not None and area_px > float(max_area_ratio) * float(frame_area):
+            continue
+
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        top_ratio = float(y / max(1, h))
+        bottom_ratio = float((y + bh) / max(1, h))
+        center_y_ratio = float((y + bh * 0.5) / max(1, h))
+        min_bbox_top_ratio = config.get("min_bbox_top_ratio")
+        max_bbox_top_ratio = config.get("max_bbox_top_ratio")
+        max_bbox_bottom_ratio = config.get("max_bbox_bottom_ratio")
+        if min_bbox_top_ratio is not None and top_ratio < float(min_bbox_top_ratio):
+            continue
+        if max_bbox_top_ratio is not None and top_ratio > float(max_bbox_top_ratio):
+            continue
+        if max_bbox_bottom_ratio is not None and bottom_ratio > float(max_bbox_bottom_ratio):
+            continue
+        if bw < min_bbox_width_px or bh < min_bbox_height_px:
+            continue
+        if max_bbox_width_ratio is not None and bw > float(max_bbox_width_ratio) * float(w):
+            continue
+        if max_bbox_height_ratio is not None and bh > float(max_bbox_height_ratio) * float(h):
+            continue
+        aspect_h_over_w = float(bh / max(1, bw))
+        if min_aspect_ratio is not None and aspect_h_over_w < float(min_aspect_ratio):
+            continue
+        if max_aspect_ratio is not None and aspect_h_over_w > float(max_aspect_ratio):
+            continue
+
+        mask_fill_ratio = float(area_px / max(1, bw * bh))
+        if mask_fill_ratio < min_mask_fill_ratio:
+            continue
+
+        border_touch = {
+            "top": bool(component[: max(1, boundary_margin_px), :].any()),
+            "bottom": bool(component[max(0, h - max(1, boundary_margin_px)) :, :].any()),
+            "left": bool(component[:, : max(1, boundary_margin_px)].any()),
+            "right": bool(component[:, max(0, w - max(1, boundary_margin_px)) :].any()),
+        }
+        touches_border = any(border_touch.values())
+        if reject_boundary_touching and touches_border:
+            continue
+
+        component_delta = delta_map[component]
+        component_delta = component_delta[np.isfinite(component_delta)]
+        if len(component_delta) == 0:
+            continue
+        delta_mean = float(np.mean(component_delta))
+        if delta_mean < min_delta_mean:
+            continue
+
+        component_depth = normalized_depth[component]
+        component_depth = component_depth[np.isfinite(component_depth)]
+        if len(component_depth) == 0:
+            continue
+        if bool(config.get("require_background_ring_delta", True)):
+            ring_dilate_px = int(config.get("delta_ring_dilate_px", 25))
+            if ring_dilate_px > 1:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_dilate_px, ring_dilate_px))
+                ring = cv2.dilate(component.astype(np.uint8), kernel).astype(bool) & (~component) & analysis
+            else:
+                ring = (~component) & analysis
+            ring_depth = normalized_depth[ring]
+            ring_depth = ring_depth[np.isfinite(ring_depth)]
+            if len(ring_depth) == 0:
+                continue
+            ring_delta = float(np.median(component_depth) - np.median(ring_depth))
+            if ring_delta < float(config.get("min_ring_delta", 0.02)):
+                continue
+        else:
+            ring_delta = None
+
+        frame_center_x = config.get("frame_center_x")
+        center_x_score = 0.0
+        if frame_center_x is not None:
+            center_x_score = max(0.0, 1.0 - abs((x + bw * 0.5) - float(frame_center_x)) / max(1.0, float(w) * 0.5))
+        target_center_y = float(config.get("target_center_y_ratio", 0.48))
+        center_y_tolerance = max(1e-6, float(config.get("center_y_tolerance_ratio", 0.25)))
+        vertical_position_score = max(0.0, 1.0 - abs(center_y_ratio - target_center_y) / center_y_tolerance)
+        bottom_penalty_start = float(config.get("bottom_penalty_start_ratio", 0.78))
+        bottom_penalty = max(0.0, (bottom_ratio - bottom_penalty_start) / max(1e-6, 1.0 - bottom_penalty_start))
+        selection_score = float(config.get("mean_delta_weight", 1.0)) * delta_mean * min(area_px, int(config.get("selection_area_cap_px", 30000)))
+        selection_score += float(config.get("vertical_shape_weight", 0.0)) * min(aspect_h_over_w, 4.0) * 100.0
+        selection_score += float(config.get("center_x_weight", 0.0)) * center_x_score * 100.0
+        selection_score += float(config.get("vertical_position_weight", 0.0)) * vertical_position_score * 100.0
+        selection_score -= float(config.get("bottom_penalty_weight", 0.0)) * bottom_penalty * 100.0
+
+        raw_bbox = [x, y, bw, bh]
+        expanded_bbox = _expand_bbox_xywh(raw_bbox, mask.shape, config)
+        candidates.append(
+            RoiCandidate(
+                roi_id=f"depth_delta_roi_{len(candidates):03d}",
+                bbox=expanded_bbox,
+                area_px=area_px,
+                touch_border=touches_border,
+                source="depth_delta_region",
+                metadata={
+                    "sources": ["depth_delta_region"],
+                    "raw_bbox": raw_bbox,
+                    "mask_fill_ratio": mask_fill_ratio,
+                    "point_count": area_px,
+                    "component_area_px": area_px,
+                    "delta_mean": delta_mean,
+                    "delta_min": float(np.min(component_delta)),
+                    "delta_max": float(np.max(component_delta)),
+                    "ring_delta": ring_delta,
+                    "selection_score": selection_score,
+                    "top_ratio": top_ratio,
+                    "bottom_ratio": bottom_ratio,
+                    "center_y_ratio": center_y_ratio,
+                    "aspect_h_over_w": aspect_h_over_w,
+                    "normalized_depth_range": _finite_range(component_depth),
+                    "border_touch": border_touch,
+                },
+            )
+        )
+    return candidates
+
+
+def _limit_delta_roi_candidates(candidates: list[RoiCandidate], config: dict[str, Any]) -> list[RoiCandidate]:
+    max_regions = int(config.get("max_selected_rois_per_frame", 0) or 0)
+    if max_regions <= 0 or len(candidates) <= max_regions:
+        return candidates
+
+    frame_center_x = config.get("frame_center_x")
+    prefer_center_weight = float(config.get("center_x_weight", 0.0))
+    vertical_shape_weight = float(config.get("vertical_shape_weight", 0.0))
+    mean_delta_weight = float(config.get("mean_delta_weight", 1.0))
+
+    def score(candidate: RoiCandidate) -> tuple[float, int]:
+        metadata = candidate.metadata or {}
+        x, _, bw, _ = [int(value) for value in candidate.bbox]
+        if "selection_score" in metadata:
+            return (float(metadata.get("selection_score", 0.0) or 0.0), int(candidate.area_px))
+        delta_mean = float(metadata.get("delta_mean", 0.0) or 0.0)
+        aspect = float(metadata.get("aspect_h_over_w", 0.0) or 0.0)
+        center_score = 0.0
+        if frame_center_x is not None:
+            candidate_center = x + bw * 0.5
+            center_score = 1.0 / (1.0 + abs(candidate_center - float(frame_center_x)))
+        value = mean_delta_weight * delta_mean * max(1, int(candidate.area_px))
+        value += vertical_shape_weight * min(aspect, 4.0) * 100.0
+        value += prefer_center_weight * center_score * 100.0
+        return (value, int(candidate.area_px))
+
+    return sorted(candidates, key=score, reverse=True)[:max_regions]
+
+
+def build_depth_delta_region_roi_candidates(
+    *,
+    absolute_depth_map: np.ndarray | None,
+    relative_depth_map: np.ndarray | None,
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+) -> list[RoiCandidate]:
+    delta_cfg = dict(config.get("depth_delta_region_roi") or {})
+    if not bool(delta_cfg.get("enabled", False)):
+        return []
+    depth_source = str(delta_cfg.get("depth_source", "absolute")).lower()
+    depth_map = absolute_depth_map if depth_source != "relative" else relative_depth_map
+    if depth_map is None or not np.any(np.isfinite(depth_map)):
+        depth_map = relative_depth_map if depth_source != "relative" else absolute_depth_map
+    if depth_map is None:
+        return []
+
+    depth = np.asarray(depth_map, dtype=np.float32)
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    if depth.shape[:2] != analysis.shape:
+        return []
+    valid = np.isfinite(depth) & (depth > 0.0) & analysis
+    if not np.any(valid):
+        return []
+
+    normalized, valid_normalized = _normalize_depth_for_gradient(
+        depth,
+        analysis,
+        delta_cfg,
+        use_inverse_depth=bool(delta_cfg.get("use_inverse_depth", True)),
+    )
+    support = valid & valid_normalized
+    if not np.any(support):
+        return []
+    normalized = _smooth_gradient_input(normalized.astype(np.float32), delta_cfg)
+
+    kernel_px = int(delta_cfg.get("background_kernel_px", 81))
+    if kernel_px % 2 == 0:
+        kernel_px += 1
+    kernel_px = max(3, kernel_px)
+    background_method = str(delta_cfg.get("background_method", "median")).lower()
+    if background_method == "morph_open":
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
+        background = cv2.morphologyEx(normalized.astype(np.float32), cv2.MORPH_OPEN, kernel)
+    elif background_method == "mean":
+        background = cv2.blur(normalized.astype(np.float32), (kernel_px, kernel_px))
+    else:
+        background_u8 = cv2.medianBlur(np.clip(normalized * 255.0, 0, 255).astype(np.uint8), kernel_px)
+        background = background_u8.astype(np.float32) / 255.0
+    raw_delta = (normalized - background).astype(np.float32)
+    delta_mode = str(delta_cfg.get("delta_mode", "positive")).lower()
+    if delta_mode in {"absolute", "abs"}:
+        delta = np.abs(raw_delta).astype(np.float32)
+    elif delta_mode in {"negative", "farther", "far"}:
+        delta = (-raw_delta).astype(np.float32)
+    else:
+        delta = raw_delta
+    delta[~support] = 0.0
+
+    threshold = delta_cfg.get("delta_threshold")
+    percentile_threshold = _finite_percentile(delta[support], float(delta_cfg.get("delta_percentile", 94.0)))
+    if threshold is None:
+        threshold = percentile_threshold
+    elif bool(delta_cfg.get("combine_fixed_and_percentile_threshold", True)) and percentile_threshold is not None:
+        threshold = max(float(threshold), percentile_threshold)
+    if threshold is None:
+        return []
+
+    seed = (delta >= float(threshold)) & support
+    cleaned = _clean_depth_residual_region_mask(seed, delta_cfg) & analysis
+    if not np.any(cleaned):
+        return []
+    delta_cfg["frame_center_x"] = float(depth.shape[1]) * 0.5
+    candidates = _depth_delta_region_components(cleaned, delta, normalized, analysis, delta_cfg)
+    return _limit_delta_roi_candidates(candidates, delta_cfg)
+
+
+def build_depth_contrast_region_roi_candidates(
+    *,
+    absolute_depth_map: np.ndarray | None,
+    relative_depth_map: np.ndarray | None,
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+) -> list[RoiCandidate]:
+    contrast_cfg = config.get("depth_contrast_region_roi") or {}
+    if not bool(contrast_cfg.get("enabled", False)):
+        return []
+    depth_source = str(contrast_cfg.get("depth_source", "absolute")).lower()
+    depth_map = absolute_depth_map if depth_source != "relative" else relative_depth_map
+    if depth_map is None or not np.any(np.isfinite(depth_map)):
+        depth_map = relative_depth_map if depth_source != "relative" else absolute_depth_map
+    if depth_map is None:
+        return []
+
+    depth = np.asarray(depth_map, dtype=np.float32)
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    if depth.shape[:2] != analysis.shape:
+        return []
+    valid = np.isfinite(depth) & (depth > 0.0) & analysis
+    if not np.any(valid):
+        return []
+
+    use_inverse = bool(contrast_cfg.get("use_inverse_depth", True))
+    values = 1.0 / np.maximum(depth, 1e-6) if use_inverse else depth.copy()
+    values = _smooth_gradient_input(values.astype(np.float32), contrast_cfg)
+    local_kernel_px = int(contrast_cfg.get("local_contrast_kernel_px", 41))
+    if local_kernel_px % 2 == 0:
+        local_kernel_px += 1
+    local_kernel_px = max(3, local_kernel_px)
+    local_min = cv2.erode(values, np.ones((local_kernel_px, local_kernel_px), dtype=np.uint8))
+    local_max = cv2.dilate(values, np.ones((local_kernel_px, local_kernel_px), dtype=np.uint8))
+    contrast = (local_max - local_min).astype(np.float32)
+    contrast[~valid] = 0.0
+
+    threshold = contrast_cfg.get("contrast_threshold")
+    if threshold is None:
+        threshold = _finite_percentile(contrast[valid], float(contrast_cfg.get("contrast_percentile", 96.0)))
+    if threshold is None:
+        return []
+    seed = (contrast >= float(threshold)) & valid
+    cleaned = _clean_depth_residual_region_mask(seed, contrast_cfg) & analysis
+    if not np.any(cleaned):
+        return []
+    candidates = _depth_contrast_region_components(cleaned, contrast, depth, analysis, contrast_cfg)
+    return _limit_contrast_roi_candidates(candidates, contrast_cfg)
+
+
+def _finite_percentile(values: np.ndarray, percentile: float) -> float | None:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if len(finite) == 0:
+        return None
+    return float(np.percentile(finite, percentile))
+
+
+def _normalize_depth_for_gradient(
+    depth_map: np.ndarray,
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+    *,
+    use_inverse_depth: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    depth = np.asarray(depth_map, dtype=np.float32)
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    valid = np.isfinite(depth) & (depth > 0.0) & analysis
+    if not np.any(valid):
+        return np.zeros_like(depth, dtype=np.float32), valid
+
+    transformed = 1.0 / np.maximum(depth, 1e-6) if use_inverse_depth else depth.copy()
+    low_pct = float(config.get("clip_low_percentile", 2.0))
+    high_pct = float(config.get("clip_high_percentile", 98.0))
+    values = transformed[valid]
+    low = _finite_percentile(values, low_pct)
+    high = _finite_percentile(values, high_pct)
+    if low is None or high is None or high <= low:
+        return np.zeros_like(depth, dtype=np.float32), valid
+
+    normalized = np.zeros_like(depth, dtype=np.float32)
+    normalized[valid] = np.clip((transformed[valid] - low) / (high - low), 0.0, 1.0).astype(np.float32)
+    fill_value = float(np.median(normalized[valid]))
+    normalized[~valid] = fill_value
+    return normalized, valid
+
+
+def _smooth_gradient_input(values: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    blur_kind = str(config.get("blur", "median")).lower()
+    kernel_px = int(config.get("blur_kernel_px", 3))
+    if kernel_px <= 1:
+        return values.astype(np.float32)
+    if kernel_px % 2 == 0:
+        kernel_px += 1
+    if blur_kind == "bilateral":
+        sigma_color = float(config.get("bilateral_sigma_color", 0.08))
+        sigma_space = float(config.get("bilateral_sigma_space", kernel_px))
+        return cv2.bilateralFilter(values.astype(np.float32), kernel_px, sigma_color, sigma_space)
+    return cv2.medianBlur(values.astype(np.float32), kernel_px)
+
+
+def _gradient_magnitude_01(values: np.ndarray, support_mask: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    kernel_px = int(config.get("gradient_kernel_px", 3))
+    if kernel_px not in {1, 3, 5, 7}:
+        kernel_px = 3
+    src = np.asarray(values, dtype=np.float32)
+    grad_x = cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=kernel_px)
+    grad_y = cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=kernel_px)
+    magnitude = cv2.magnitude(grad_x, grad_y)
+    scale_pct = float(config.get("gradient_scale_percentile", 99.0))
+    scale = _finite_percentile(magnitude[np.asarray(support_mask, dtype=bool)], scale_pct)
+    if scale is None or scale <= 0.0:
+        return np.zeros_like(magnitude, dtype=np.float32)
+    return np.clip(magnitude / scale, 0.0, 1.0).astype(np.float32)
+
+
+def _threshold_gradient_mask(
+    magnitude: np.ndarray,
+    support_mask: np.ndarray,
+    percentile_key: str,
+    min_key: str,
+    config: dict[str, Any],
+) -> np.ndarray:
+    support = np.asarray(support_mask, dtype=bool)
+    if not np.any(support):
+        return np.zeros_like(magnitude, dtype=bool)
+    percentile = float(config.get(percentile_key, 92.0))
+    minimum = float(config.get(min_key, 0.03))
+    threshold = _finite_percentile(magnitude[support], percentile)
+    if threshold is None:
+        threshold = minimum
+    return (magnitude >= max(minimum, threshold)) & support
+
+
+def _build_color_edge_mask(image: np.ndarray | None, analysis_mask: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    if image is None or not bool(config.get("use_color_edges", True)):
+        shape = np.asarray(analysis_mask).shape
+        return np.zeros(shape, dtype=bool), np.zeros(shape, dtype=np.float32)
+    frame = np.asarray(image)
+    if frame.ndim == 3 and frame.shape[2] >= 3:
+        gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
+    elif frame.ndim == 2:
+        gray = frame
+    else:
+        shape = np.asarray(analysis_mask).shape
+        return np.zeros(shape, dtype=bool), np.zeros(shape, dtype=np.float32)
+    gray_f = gray.astype(np.float32) / 255.0
+    gray_f = _smooth_gradient_input(gray_f, config)
+    magnitude = _gradient_magnitude_01(gray_f, analysis_mask, config)
+    mask = _threshold_gradient_mask(
+        magnitude,
+        analysis_mask,
+        "color_gradient_percentile",
+        "min_color_gradient",
+        config,
+    )
+    return mask, magnitude
+
+
+def _clean_gradient_roi_mask(mask: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    cleaned = mask.astype(np.uint8)
+    close_kernel_px = int(config.get("morph_close_kernel", config.get("close_kernel_px", 5)))
+    if close_kernel_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_px, close_kernel_px))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    dilate_iterations = int(config.get("morph_dilate_iterations", 1))
+    dilate_kernel_px = int(config.get("morph_dilate_kernel", config.get("dilate_kernel_px", 3)))
+    if dilate_iterations > 0 and dilate_kernel_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_kernel_px, dilate_kernel_px))
+        cleaned = cv2.dilate(cleaned, kernel, iterations=dilate_iterations)
+    open_kernel_px = int(config.get("morph_open_kernel", 0))
+    if open_kernel_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel_px, open_kernel_px))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+    return cleaned.astype(bool)
+
+
+def _road_prior_context(
+    road_mask: np.ndarray | None,
+    analysis_mask: np.ndarray,
+    config: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    road_cfg = config.get("road_prior") or {}
+    if road_mask is None or not bool(road_cfg.get("enabled", True)):
+        return analysis, {"enabled": False, "available": road_mask is not None}
+    road = np.asarray(road_mask, dtype=bool)
+    if road.shape != analysis.shape:
+        return analysis, {"enabled": False, "available": False}
+    dilate_px = int(road_cfg.get("dilate_px", 24))
+    context = road.astype(np.uint8)
+    if dilate_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
+        context = cv2.dilate(context, kernel)
+    context_bool = context.astype(bool) & analysis
+    if not np.any(context_bool):
+        return analysis, {"enabled": False, "available": True, "empty_after_gating": True}
+    return context_bool, {"enabled": True, "available": True, "dilate_px": dilate_px}
+
+
+def _gradient_roi_components(
+    mask: np.ndarray,
+    depth_gradient: np.ndarray,
+    color_gradient: np.ndarray,
+    depth_map: np.ndarray,
+    road_context: np.ndarray,
+    road_prior_info: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    depth_source_used: str,
+) -> list[RoiCandidate]:
+    min_area_px = int(config.get("min_component_area_px", config.get("min_area_px", 80)))
+    max_area_ratio = config.get("max_component_area_ratio")
+    min_bbox_width_px = int(config.get("min_bbox_width_px", 1))
+    min_bbox_height_px = int(config.get("min_bbox_height_px", 1))
+    min_mask_fill_ratio = float(config.get("min_mask_fill_ratio", 0.0))
+    max_aspect_ratio = config.get("max_bbox_aspect_ratio")
+    reject_boundary_touching = bool(config.get("reject_boundary_touching", False))
+    boundary_margin_px = int(config.get("boundary_margin_px", 1))
+    road_cfg = config.get("road_prior") or {}
+    min_road_overlap = float(road_cfg.get("min_overlap_ratio", 0.0)) if bool(road_prior_info.get("enabled", False)) else 0.0
+    require_bottom_contact = bool(road_cfg.get("require_bottom_contact", False)) if bool(road_prior_info.get("enabled", False)) else False
+    bottom_band_ratio = float(road_cfg.get("bottom_contact_band_ratio", 0.25))
+    bottom_band_px_cfg = road_cfg.get("bottom_contact_band_px")
+
+    num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    h, w = mask.shape
+    frame_area = max(1, h * w)
+    candidates: list[RoiCandidate] = []
+
+    for label in range(1, num_labels):
+        component = label_img == label
+        area_px = int(stats[label, cv2.CC_STAT_AREA])
+        if area_px < min_area_px:
+            continue
+        if max_area_ratio is not None and area_px > float(max_area_ratio) * float(frame_area):
+            continue
+
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if bw < min_bbox_width_px or bh < min_bbox_height_px:
+            continue
+        if max_aspect_ratio is not None:
+            aspect = max(float(bw) / max(1.0, float(bh)), float(bh) / max(1.0, float(bw)))
+            if aspect > float(max_aspect_ratio):
+                continue
+
+        raw_bbox = [x, y, bw, bh]
+        mask_fill_ratio = float(area_px / max(1, bw * bh))
+        if mask_fill_ratio < min_mask_fill_ratio:
+            continue
+
+        border_touch = {
+            "top": bool(component[: max(1, boundary_margin_px), :].any()),
+            "bottom": bool(component[max(0, h - max(1, boundary_margin_px)) :, :].any()),
+            "left": bool(component[:, : max(1, boundary_margin_px)].any()),
+            "right": bool(component[:, max(0, w - max(1, boundary_margin_px)) :].any()),
+        }
+        touches_border = any(border_touch.values())
+        if reject_boundary_touching and touches_border:
+            continue
+
+        bbox_road = road_context[y : y + bh, x : x + bw]
+        road_overlap_ratio = float(np.count_nonzero(bbox_road) / max(1, bw * bh))
+        if road_overlap_ratio < min_road_overlap:
+            continue
+        if bottom_band_px_cfg is None:
+            bottom_band_px = max(1, int(round(float(bh) * bottom_band_ratio)))
+        else:
+            bottom_band_px = max(1, int(bottom_band_px_cfg))
+        bottom_y0 = max(y, y + bh - bottom_band_px)
+        bottom_contact = bool(np.any(road_context[bottom_y0 : y + bh, x : x + bw]))
+        if require_bottom_contact and not bottom_contact:
+            continue
+
+        component_depth_gradient = depth_gradient[component]
+        component_color_gradient = color_gradient[component]
+        component_depth = depth_map[component]
+        component_depth = component_depth[np.isfinite(component_depth)]
+        expanded_bbox = _expand_bbox_xywh(raw_bbox, mask.shape, config)
+        candidates.append(
+            RoiCandidate(
+                roi_id=f"depth_gradient_roi_{len(candidates):03d}",
+                bbox=expanded_bbox,
+                area_px=area_px,
+                touch_border=touches_border,
+                source="depth_gradient_contour",
+                metadata={
+                    "sources": ["depth_gradient_contour"],
+                    "raw_bbox": raw_bbox,
+                    "mask_fill_ratio": mask_fill_ratio,
+                    "point_count": area_px,
+                    "component_area_px": area_px,
+                    "depth_source_used": depth_source_used,
+                    "depth_gradient_score": float(np.mean(component_depth_gradient)) if len(component_depth_gradient) else 0.0,
+                    "color_edge_score": float(np.mean(component_color_gradient)) if len(component_color_gradient) else 0.0,
+                    "depth_range": _finite_range(component_depth),
+                    "road_prior_overlap_ratio": road_overlap_ratio,
+                    "road_prior_bottom_contact": bottom_contact,
+                    "road_prior": dict(road_prior_info),
+                    "border_touch": border_touch,
+                },
+            )
+        )
+    return candidates
+
+
+def build_depth_gradient_contour_roi_candidates(
+    *,
+    image: np.ndarray | None,
+    absolute_depth_map: np.ndarray | None,
+    relative_depth_map: np.ndarray | None,
+    analysis_mask: np.ndarray,
+    road_mask: np.ndarray | None,
+    config: dict[str, Any],
+) -> list[RoiCandidate]:
+    contour_cfg = config.get("depth_gradient_contour_roi") or {}
+    if not bool(contour_cfg.get("enabled", False)):
+        return []
+
+    depth_source = str(contour_cfg.get("depth_source", "absolute")).lower()
+    depth_map = absolute_depth_map if depth_source != "relative" else relative_depth_map
+    depth_source_used = "absolute" if depth_source != "relative" else "relative"
+    if depth_map is None or not np.any(np.isfinite(depth_map)):
+        depth_map = relative_depth_map if depth_source_used == "absolute" else absolute_depth_map
+        depth_source_used = "relative" if depth_source_used == "absolute" else "absolute"
+    if depth_map is None:
+        return []
+
+    analysis = np.asarray(analysis_mask, dtype=bool)
+    if analysis.shape != np.asarray(depth_map).shape[:2]:
+        return []
+
+    use_inverse_depth = bool(contour_cfg.get("use_inverse_depth", depth_source_used == "absolute"))
+    normalized_depth, valid_depth = _normalize_depth_for_gradient(
+        np.asarray(depth_map, dtype=np.float32),
+        analysis,
+        contour_cfg,
+        use_inverse_depth=use_inverse_depth,
+    )
+    valid_interior = cv2.erode(valid_depth.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)).astype(bool) & analysis
+    if not np.any(valid_interior):
+        return []
+
+    smoothed_depth = _smooth_gradient_input(normalized_depth, contour_cfg)
+    depth_gradient = _gradient_magnitude_01(smoothed_depth, valid_interior, contour_cfg)
+    depth_edge_mask = _threshold_gradient_mask(
+        depth_gradient,
+        valid_interior,
+        "depth_gradient_percentile",
+        "min_depth_gradient",
+        contour_cfg,
+    )
+
+    color_edge_mask, color_gradient = _build_color_edge_mask(image, analysis, contour_cfg)
+    color_support_px = int(contour_cfg.get("color_depth_support_dilate_px", 5))
+    depth_support = depth_edge_mask.astype(np.uint8)
+    if color_support_px > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (color_support_px, color_support_px))
+        depth_support = cv2.dilate(depth_support, kernel)
+    color_edge_mask = color_edge_mask & depth_support.astype(bool)
+
+    road_context, road_prior_info = _road_prior_context(road_mask, analysis, contour_cfg)
+    seed_mask = (depth_edge_mask | color_edge_mask) & analysis & valid_interior & road_context
+    cleaned = _clean_gradient_roi_mask(seed_mask, contour_cfg) & analysis & road_context
+    if not np.any(cleaned):
+        return []
+
+    return _gradient_roi_components(
+        cleaned,
+        depth_gradient,
+        color_gradient,
+        np.asarray(depth_map, dtype=np.float32),
+        road_context,
+        road_prior_info,
+        contour_cfg,
+        depth_source_used=depth_source_used,
+    )
 
 
 def build_depth_residual_roi_candidates(
