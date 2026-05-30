@@ -642,6 +642,8 @@ def _draw_processing_roi(canvas: np.ndarray, processing_roi: dict[str, Any] | No
             _put_label(canvas, "FoE", (x + 6, y - 6), (255, 0, 255))
     road_edges = foe_roi.get("road_edges") or {}
     for name, edge in road_edges.items():
+        if not isinstance(edge, dict):
+            continue
         endpoints = edge.get("endpoints") or []
         if len(endpoints) == 2:
             p0 = tuple(int(value) for value in endpoints[0])
